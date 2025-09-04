@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 import asyncio
-import threading
 import os
 import datetime
 import json
@@ -11,7 +10,7 @@ from telethon.errors import SessionPasswordNeededError
 # --------------------------
 # Настройка
 # --------------------------
-SESSION_DIR = "sessions"
+SESSION_DIR = "session"
 os.makedirs(SESSION_DIR, exist_ok=True)
 
 STATE_FILE = "state.json"
@@ -81,7 +80,7 @@ def make_handlers_for(client: TelegramClient):
     async def on_new_message(event):
         st = state.get(name, {})
 
-        # --- AUTO-REPLY (для всех личек) ---
+        # --- AUTO-REPLY ---
         try:
             if st.get("auto_reply") and event.is_private:
                 trigger = (st.get("trigger") or "").lower()
@@ -93,30 +92,24 @@ def make_handlers_for(client: TelegramClient):
         except Exception as e:
             print(f"[{name}] AutoReply error: {e}")
 
-        # --- AUTO-READ (для всех личек, даже не в контактах) ---
+        # --- AUTO-READ ---
         try:
             if st.get("auto_read") and event.is_private:
                 mid = getattr(event.message, "id", None)
                 if mid is not None:
-                    # Берём корректный InputPeer прямо из события
                     try:
                         peer = await event.get_input_chat()
                     except Exception:
-                        # запасной вариант: input отправителя
                         peer = await event.get_input_sender()
-
                     try:
-                        # низкоуровневый RPC – самый надёжный
                         await client(functions.messages.ReadHistoryRequest(
                             peer=peer,
                             max_id=mid
                         ))
                     except Exception:
-                        # мягкий откат: high-level helper
                         try:
                             await client.send_read_acknowledge(peer, max_id=mid)
                         except Exception:
-                            # последний шанс: отметить сам объект сообщения
                             try:
                                 await event.message.mark_read()
                             except Exception:
@@ -127,9 +120,8 @@ def make_handlers_for(client: TelegramClient):
 
     return on_new_message
 
-
 # --------------------------
-# Основные функции (30+)
+# Основные функции
 # --------------------------
 async def send_message(client):
     target = input("Введите username или ID получателя: ").strip()
@@ -339,6 +331,24 @@ async def session_info(client):
     print(f"Username: {getattr(me,'username',None)}")
     print(f"Name: {getattr(me,'first_name','')} {getattr(me,'last_name','')}")
 
+async def delete_session(client):
+    name = session_name_from_client(client)
+    confirm = input(f"Удалить сессию {name}? (y/n): ").strip().lower()
+    if confirm != "y": return
+    try:
+        await client.log_out()
+    except: pass
+    clients.remove(client)
+    session_path = client.session.filename
+    if os.path.exists(session_path):
+        os.remove(session_path)
+    if name in state:
+        del state[name]
+    if name in meta:
+        del meta[name]
+    save_state()
+    print(f"[OK] Сессия {name} удалена")
+
 # --------------------------
 # Добавление аккаунта по номеру
 # --------------------------
@@ -363,104 +373,100 @@ async def add_account_by_phone():
 
     clients.append(client)
     state[session_name] = {"auto_reply": False, "trigger": "", "reply": "", "auto_read": False}
-    meta[session_name] = {"started": datetime.datetime.now(), "login_time": datetime.datetime.now()}
+    meta[session_name] = {"started": datetime.datetime.now(), "login_time": datetime.datetime.now(), "me": await client.get_me()}
+    client.add_event_handler(make_handlers_for(client), events.NewMessage)
     save_state()
-    handler = make_handlers_for(client)
-    client.add_event_handler(handler, events.NewMessage(incoming=True))
-    asyncio.create_task(client.run_until_disconnected())
-    print(f"[OK] Аккаунт {phone} добавлен и готов к использованию")
+    print(f"[OK] Аккаунт {session_name} подключен")
     return client
 
 # --------------------------
-# Меню в отдельном потоке
+# Загрузка всех сессий
 # --------------------------
-def menu_thread(loop):
-    def run_coro(coro): 
-        return asyncio.run_coroutine_threadsafe(coro, loop).result()
+async def load_all_accounts():
+    load_state()
+    for fname in os.listdir(SESSION_DIR):
+        if fname.endswith(".session"):
+            session_path = os.path.join(SESSION_DIR, fname)
+            client = TelegramClient(session_path, DEFAULT_API_ID, DEFAULT_API_HASH)
+            try:
+                await client.connect()
+                if not await client.is_user_authorized():
+                    print(f"[INFO] Неавторизованная сессия {fname}, пропущена")
+                    await client.disconnect()
+                    continue
+            except Exception as e:
+                print(f"[WARN] Не удалось подключить {fname}: {e}")
+                continue
+            clients.append(client)
+            meta[fname.replace(".session","")] = {"started": datetime.datetime.now(), "login_time": datetime.datetime.now(), "me": await client.get_me()}
+            client.add_event_handler(make_handlers_for(client), events.NewMessage)
+            print(f"[OK] Сессия {fname} загружена")
 
-    while True:
+# --------------------------
+# Асинхронное меню
+# --------------------------
+async def menu_async():
+    actions = [
+        send_message, send_photo, send_video, send_file_doc,
+        show_chats, read_last_messages, show_contacts, show_groups,
+        auto_reply_enable, auto_reply_disable, auto_read_enable, auto_read_disable,
+        create_group, create_channel, add_to_group, leave_group,
+        change_profile_photo, change_name, show_me, unread_chats,
+        clear_history, delete_message, mass_broadcast, account_stats,
+        scheduled_message, send_reaction, logout_current, logout_all_devices,
+        session_info, delete_session
+    ]
+
+    def print_main():
         print("\n=== Главное меню ===")
         print("1 - Показать аккаунты")
         print("2 - Добавить аккаунт по номеру")
         print("Q - Выход")
-        choice = input("Выбор: ").strip().lower()
 
+    def print_account_actions():
+        print("\n--- Действия для аккаунта ---")
+        for idx, fn in enumerate(actions,1):
+            print(f"{idx} - {fn.__name__}")
+        print("0 - Back")
+
+    while True:
+        print_main()
+        choice = input("Выбор: ").strip().lower()
+        if choice == "q": break
         if choice == "1":
+            if not clients:
+                print("[INFO] Нет подключенных аккаунтов")
+                continue
             for idx, c in enumerate(clients, 1):
                 print(f"{idx} - {session_name_from_client(c)}")
             sel = input("Выбери аккаунт по номеру или 0 для назад: ").strip()
-            if sel == "0": continue
-            if not sel.isdigit(): print("Неверный выбор"); continue
-            i = int(sel) - 1
-            if not (0 <= i < len(clients)): print("Неверный индекс"); continue
-            client = clients[i]
-
+            if sel=="0": continue
+            if not sel.isdigit(): continue
+            idx = int(sel)-1
+            if not (0 <= idx < len(clients)): continue
+            client = clients[idx]
             while True:
-                print(f"\n--- Действия для {session_name_from_client(client)} ---")
-                actions = [
-                    ("Send Message", send_message),
-                    ("Send Photo", send_photo),
-                    ("Send Video", send_video),
-                    ("Send File", send_file_doc),
-                    ("Show Chats", show_chats),
-                    ("Read Last Messages", read_last_messages),
-                    ("Show Contacts", show_contacts),
-                    ("Show Groups", show_groups),
-                    ("AutoReply ON", auto_reply_enable),
-                    ("AutoReply OFF", auto_reply_disable),
-                    ("AutoRead ON", auto_read_enable),
-                    ("AutoRead OFF", auto_read_disable),
-                    ("Create Group", create_group),
-                    ("Create Channel", create_channel),
-                    ("Add to Group", add_to_group),
-                    ("Leave Group", leave_group),
-                    ("Change Profile Photo", change_profile_photo),
-                    ("Change Name", change_name),
-                    ("Show Me", show_me),
-                    ("Unread Chats", unread_chats),
-                    ("Clear History", clear_history),
-                    ("Delete Message", delete_message),
-                    ("Mass Broadcast", mass_broadcast),
-                    ("Account Stats", account_stats),
-                    ("Scheduled Message", scheduled_message),
-                    ("Send Reaction", send_reaction),
-                    ("Logout Current", logout_current),
-                    ("Logout All", logout_all_devices),
-                    ("Session Info", session_info)
-                ]
-                for idx, (label, _) in enumerate(actions, 1):
-                    print(f"{idx} - {label}")
-                print("0 - Back")
+                print_account_actions()
                 a = input("Выбор: ").strip()
-                if a == "0": break
+                if a=="0": break
                 if not a.isdigit() or not (1 <= int(a) <= len(actions)):
-                    print("[!] Неверный выбор"); continue
-                fn = actions[int(a)-1][1]
-                run_coro(fn(client))
-
+                    print("[!] Неверный выбор")
+                    continue
+                fn = actions[int(a)-1]
+                try:
+                    await fn(client)
+                except Exception as e:
+                    print(f"[ERR] {e}")
         elif choice == "2":
-            fut = asyncio.run_coroutine_threadsafe(add_account_by_phone(), loop)
-            fut.result()
-
-        elif choice == "q":
-            print("Выход.")
-            os._exit(0)
-        else:
-            print("[!] Неверный выбор")
+            await add_account_by_phone()
 
 # --------------------------
 # Main
 # --------------------------
 async def main():
-    load_state()
-    loop = asyncio.get_running_loop()
-    t = threading.Thread(target=menu_thread, args=(loop,), daemon=True)
-    t.start()
-    await asyncio.Event().wait()  # держим процесс живым
+    await load_all_accounts()
+    await menu_async()
 
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("Остановлено вручную")
+if __name__=="__main__":
+    asyncio.run(main())
 
