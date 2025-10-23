@@ -1,1012 +1,1359 @@
 # -*- coding: utf-8 -*-
-"""
-tg_accounts_bot.py
-Single-file TeleBot frontend + Telethon backend.
-Features:
-- Admins (ADMINS) full control over all sessions (use, logout_all, remove local)
-- Owner saved on add and always has full access
-- Password-protected access for third parties
-- Show last 5 messages by username or id
-- Thread-safe structures and state persistence to state.json
-- Handles 2FA, timeouts and common errors
-Usage: set BOT_TOKEN, API_ID, API_HASH, ADMINS
-"""
-import os
-import json
-import time
-import threading
 import asyncio
-import html
-import hashlib
-from typing import Optional, Dict, Any, List
+import os
+import datetime
+import json
+import sys
+from telethon import TelegramClient, events
+from telethon.tl import functions, types
+from telethon.errors import SessionPasswordNeededError, FloodWaitError
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, filters, ContextTypes, 
+    ConversationHandler, CallbackQueryHandler
+)
 
-from telebot import TeleBot, types, apihelper
-from telethon import TelegramClient, events, functions
-from telethon.errors import SessionPasswordNeededError, UsernameNotOccupiedError
-
-# ---------------- CONFIG ----------------
-BOT_TOKEN = "7577232373:AAGau19QU2x_TVmIJjQPWw60jb8WAySkgU4"
-API_ID = 20111454
-API_HASH = "e0040834c399df8ac420058eee0af322"
-
-# set admin telegram ids
-ADMINS = {6999672555}
-
-SESSIONS_DIR = "sessions"
+# --------------------------
+# Configuration & Global Data
+# --------------------------
+SESSION_DIR = "session"
+os.makedirs(SESSION_DIR, exist_ok=True)
 STATE_FILE = "state.json"
-os.makedirs(SESSIONS_DIR, exist_ok=True)
+PASSWORD_FILE = "passwords.json" 
+# Время доступа в секундах (30 минут)
+ACCESS_TIMEOUT_SECONDS = 30 * 60 
 
-bot = TeleBot(BOT_TOKEN, parse_mode="HTML")
+# API KEYS - Hardcoded to avoid console prompts
+DEFAULT_API_ID = 20111454 
+DEFAULT_API_HASH = "e0040834c399df8ac420058eee0af322" 
+# ТОКЕН: ИСПОЛЬЗУЙТЕ СВОЙ АКТУАЛЬНЫЙ ТОКЕН
+BOT_TOKEN = "8243967657:AAFkeKxRcgzRObKrSwF2_PGr3g83s4NHD3U" 
 
-# ---------------- concurrency primitives ----------------
-_wrappers_lock = threading.RLock()
-_pending_lock = threading.RLock()
-_state_lock = threading.RLock()
-_allowed_lock = threading.RLock()
+# АДМИН: ВВЕДИТЕ ВАШ TELEGRAM ID ДЛЯ ПОЛУЧЕНИЯ ПОЛНОГО ДОСТУПА БЕЗ ПАРОЛЯ
+ADMIN_ID = 5934507030  # <--- ЗАМЕНИТЕ НА СВОЙ ID
 
-# ---------------- runtime storage ----------------
-wrappers: List["ClientWrapper"] = []
-session_names: List[str] = []
-pending_wrappers: Dict[int, Dict[str, Any]] = {}
-pending_next = 0
+# Data Structures
+clients = {}    # {chat_id: {session_name: TelegramClient}} - СВЯЗКА ЧАТ_ID и СЕССИЙ (для отслеживания, кто добавил)
+loaded_clients = {} # {session_name: TelegramClient} - ЗАГРУЖЕННЫЕ СЕССИИ (полный список)
+state = {}      # {session_name: {"auto_reply": bool, "trigger": str, "reply": str, "auto_read": bool}}
+meta = {}       # {session_name: {"started": datetime, "login_time": datetime, "me": user_obj}}
+passwords = {}  # {session_name: "clean_password_string"} <-- ХРАНИТ ЧИСТЫЕ ПАРОЛИ
+access_grants = {} # {chat_id: {session_name: datetime.datetime}} - Хранит время, до которого разрешен доступ
 
-state_store: Dict[str, Dict[str, Any]] = {}
-user_fsm: Dict[int, Dict[str, Any]] = {}
-allowed_sessions_per_user: Dict[int, List[int]] = {}
+# State for ConversationHandler
+(ADD_PHONE, ADD_CODE, ADD_2FA, SET_PASSWORD, SELECT_ACCOUNT, 
+ CONFIRM_PASSWORD, ACTION_SELECT, INPUT, PASS_SELECT_CHANGE) = range(9)
 
-# ---------------- util ----------------
-def _safe_write_state():
-    with _state_lock:
-        try:
-            with open(STATE_FILE, "w", encoding="utf-8") as f:
-                json.dump(state_store, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
+# Новые состояния для изменения 2FA
+(INPUT_OLD_2FA, INPUT_NEW_2FA, INPUT_HINT_2FA, INPUT_EMAIL_2FA) = range(9, 13) 
 
+# --------------------------
+# Load and Save State
+# --------------------------
 def load_state():
-    global state_store
-    with _state_lock:
-        if os.path.exists(STATE_FILE):
-            try:
-                with open(STATE_FILE, "r", encoding="utf-8") as f:
-                    state_store = json.load(f)
-            except Exception:
-                state_store = {}
-        else:
-            state_store = {}
+    """Loads state and passwords from JSON files."""
+    global state, passwords
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                state.update(json.load(f))
+        except Exception:
+            pass
+    if os.path.exists(PASSWORD_FILE):
+        try:
+            with open(PASSWORD_FILE, "r", encoding="utf-8") as f:
+                passwords.update(json.load(f))
+        except Exception:
+            pass
 
-load_state()
-
-def sanitize(s: str) -> str:
-    return html.escape(str(s))
-
-def set_fsm(user_id: int, state: str, data: Optional[Dict[str, Any]] = None):
-    user_fsm[user_id] = {"state": state, "data": data or {}}
-
-def get_fsm(user_id: int) -> Optional[Dict[str, Any]]:
-    return user_fsm.get(user_id)
-
-def clear_fsm(user_id: int):
-    user_fsm.pop(user_id, None)
-
-def hash_password(pwd: str, salt: Optional[str] = None) -> str:
-    if salt is None:
-        salt = os.urandom(8).hex()
-    h = hashlib.sha256((salt + pwd).encode("utf-8")).hexdigest()
-    return f"{salt}${h}"
-
-def verify_password(stored: str, candidate: str) -> bool:
+def save_state():
+    """Saves state and passwords to JSON files."""
     try:
-        salt, h = stored.split("$", 1)
-        return hashlib.sha256((salt + candidate).encode("utf-8")).hexdigest() == h
+        with open(PASSWORD_FILE, "w", encoding="utf-8") as f:
+            # Сохраняем чистые пароли
+            json.dump(passwords, f, ensure_ascii=False, indent=2)
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[ERROR] Failed to save state/passwords: {e}")
+
+# --------------------------
+# Utilities and Access Control
+# --------------------------
+def session_name_from_client(client: TelegramClient) -> str:
+    """Extracts session name from a Telethon client."""
+    try:
+        if client.session and client.session.filename:
+            return os.path.basename(client.session.filename).replace(".session", "")
+    except:
+        pass
+    return str(id(client)) 
+
+async def resolve_entity(client: TelegramClient, peer_str: str):
+    """Resolves a chat/user string (username or ID) to a Telethon entity."""
+    try:
+        return await client.get_entity(peer_str)
     except Exception:
-        return False
-
-# ---------------- Telethon wrapper ----------------
-class ClientWrapper:
-    def __init__(self, session_name: str, api_id:int=API_ID, api_hash:str=API_HASH):
-        self.session_name = session_name
-        # Telethon accepts either a path or a session name; use full path to avoid collisions
-        self.session_path = os.path.join(SESSIONS_DIR, session_name)
-        self.api_id = api_id
-        self.api_hash = api_hash
-        self.loop: Optional[asyncio.AbstractEventLoop] = None
-        self.client: Optional[TelegramClient] = None
-        self.thread: Optional[threading.Thread] = None
-        self._ready = threading.Event()
-        self._stop = False
-        self._handlers_attached = False
-
-    def start_thread(self, wait: float = 10.0):
-        if self.thread and self.thread.is_alive():
-            return
-        t = threading.Thread(target=self._thread_main, daemon=True)
-        self.thread = t
-        t.start()
-        self._ready.wait(timeout=wait)
-
-    def _thread_main(self):
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        self.loop = loop
         try:
-            # create client with file-based session name
-            self.client = TelegramClient(self.session_path, self.api_id, self.api_hash)
-            loop.run_until_complete(self._connect_and_idle())
+            return int(peer_str)
         except Exception:
-            try:
-                loop.run_forever()
-            except Exception:
-                pass
+            raise ValueError(f"Could not resolve entity for '{peer_str}'")
 
-    async def _connect_and_idle(self):
-        try:
-            await self.client.connect()
-        except Exception:
-            pass
-        if not self._handlers_attached:
-            attach_auto_handlers(self, self.session_name)
-            self._handlers_attached = True
-        self._ready.set()
-        while not self._stop:
-            await asyncio.sleep(60)
+def get_client(chat_id: str, session_name: str) -> TelegramClient | None:
+    """Safely retrieves a client linked to a specific chat_id."""
+    return loaded_clients.get(session_name)
 
-    def run_coro(self, coro):
-        if not self.thread or not self.thread.is_alive() or self.loop is None:
-            self.start_thread()
-        wait_seconds = 0.0
-        while self.loop is None and wait_seconds < 5.0:
-            time.sleep(0.05)
-            wait_seconds += 0.05
-        if self.loop is None:
-            raise RuntimeError("Client loop not available")
-        fut = asyncio.run_coroutine_threadsafe(coro, self.loop)
-        return fut
+def grant_access(chat_id: str, session_name: str):
+    """Grants 30 minutes access to a session for a given chat_id."""
+    expires_at = datetime.datetime.now() + datetime.timedelta(seconds=ACCESS_TIMEOUT_SECONDS)
+    access_grants.setdefault(chat_id, {})[session_name] = expires_at
 
-    def is_authorized(self, timeout=5) -> bool:
-        try:
-            if not self.client:
-                return False
-            fut = self.run_coro(self.client.is_user_authorized())
-            return bool(fut.result(timeout=timeout))
-        except Exception:
-            return False
+def check_access_validity(chat_id: str, session_name: str) -> bool:
+    """
+    Checks if access is still valid OR if the user is the Admin.
+    """
+    if str(chat_id) == str(ADMIN_ID):
+        return True # <-- АДМИН НЕ ТРЕБУЕТ ПАРОЛЯ
 
-    def disconnect(self):
-        try:
-            self._stop = True
-            if self.client and self.loop:
-                try:
-                    self.run_coro(self.client.disconnect()).result(timeout=10)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-# ---------------- finalize / remove ----------------
-def finalize_authorized_wrapper(wrapper: ClientWrapper, owner_user_id: Optional[int]=None):
-    with _wrappers_lock:
-        if wrapper.session_name in session_names:
-            return session_names.index(wrapper.session_name)
-        wrappers.append(wrapper)
-        session_names.append(wrapper.session_name)
-    with _state_lock:
-        st = state_store.setdefault(wrapper.session_name, {
-            "auto_reply": False,
-            "trigger": "",
-            "reply": "",
-            "auto_read": False,
-            "password": "",
-            "owner_user_id": None
-        })
-        if owner_user_id is not None:
-            st["owner_user_id"] = int(owner_user_id)
-        _safe_write_state()
-    return len(wrappers)-1
-
-def remove_local_session_by_idx(idx:int):
-    with _wrappers_lock:
-        if 0 <= idx < len(wrappers):
-            w = wrappers.pop(idx)
-            name = session_names.pop(idx)
-            try:
-                w.disconnect()
-            except Exception:
-                pass
-            base = os.path.join(SESSIONS_DIR, name)
-            # remove common Telethon session file extensions
-            for ext in ("", ".session", ".session-journal", ".sqlite", ".json"):
-                path = base + ext
-                try:
-                    if os.path.exists(path):
-                        os.remove(path)
-                except Exception:
-                    pass
-            with _state_lock:
-                if name in state_store:
-                    state_store.pop(name)
-                    _safe_write_state()
-            return True
+    grants = access_grants.get(chat_id, {})
+    expires_at = grants.get(session_name)
+    
+    if expires_at and datetime.datetime.now() < expires_at:
+        return True
+        
+    if session_name in grants:
+        del grants[session_name]
+    if not grants:
+        access_grants.pop(chat_id, None)
+        
     return False
 
-# ---------------- keyboards ----------------
-def main_kb(user_id: Optional[int]=None):
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row("➕ Добавить аккаунт", "📂 Аккаунты")
-    kb.row("ℹ️ Помощь")
-    if user_id and user_id in ADMINS:
-        kb.row("⚙️ Админ")
-    return kb
-
-def accounts_kb():
-    kb = types.InlineKeyboardMarkup()
-    with _wrappers_lock:
-        if not session_names:
-            kb.add(types.InlineKeyboardButton("➕ Добавить", callback_data="add_account"))
-            return kb
-        for i, name in enumerate(session_names, 1):
-            kb.add(types.InlineKeyboardButton(f"{i}. {name}", callback_data=f"acc:{i-1}"))
-    kb.add(types.InlineKeyboardButton("➕ Добавить", callback_data="add_account"))
-    return kb
-
-def account_menu_kb(idx: int, limited: bool=False):
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    actions = [
-        ("✉️ Send", f"send:{idx}"),
-        ("🖼 Send Photo", f"send_photo:{idx}"),
-        ("📎 Send File", f"send_file:{idx}"),
-        ("📇 Contacts", f"contacts:{idx}"),
-        ("💬 Chats", f"chats:{idx}"),
-        ("📂 Groups", f"groups:{idx}"),
-        ("📣 Broadcast", f"broadcast:{idx}"),
-        ("⏰ Schedule", f"schedule:{idx}"),
-        ("🔁 Show last 5", f"show_last:{idx}")
-    ]
-    for lbl, cb in actions:
-        kb.add(types.InlineKeyboardButton(lbl, callback_data=cb))
-    if not limited:
-        kb.add(types.InlineKeyboardButton("🤖 AR ON", f"ar_on:{idx}"),
-               types.InlineKeyboardButton("⛔ AR OFF", f"ar_off:{idx}"))
-        kb.add(types.InlineKeyboardButton("👁 ARD ON", f"ard_on:{idx}"),
-               types.InlineKeyboardButton("🙈 ARD OFF", f"ard_off:{idx}"))
-        kb.add(types.InlineKeyboardButton("ℹ️ Info", f"info:{idx}"),
-               types.InlineKeyboardButton("🚪 Logout", f"logout:{idx}"))
-        kb.add(types.InlineKeyboardButton("🗑 Удалить локальную сессию", f"remove_local:{idx}"))
-    kb.add(types.InlineKeyboardButton("🔙 Назад", callback_data="back_accounts"))
-    return kb
-
-def password_choice_kb(idx:int):
-    kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton("Установить пароль", callback_data=f"set_pwd:{idx}"),
-           types.InlineKeyboardButton("Пропустить", callback_data=f"skip_pwd:{idx}"))
-    return kb
-
-# ---------------- auto handlers ----------------
-def attach_auto_handlers(wrapper: ClientWrapper, session_name: str):
-    if not wrapper.client:
-        return
-    client = wrapper.client
-
-    @client.on(events.NewMessage(incoming=True))
-    async def _on_new(event):
-        try:
-            with _state_lock:
-                st = state_store.get(session_name, {})
-            if st.get("auto_reply") and event.is_private:
-                trig = (st.get("trigger") or "").lower()
-                rep = st.get("reply") or ""
+# --------------------------
+# Handlers: AutoReply + AutoRead
+# --------------------------
+def make_handlers_for(client: TelegramClient):
+    """Creates event handlers for a specific Telethon client."""
+    name = session_name_from_client(client)
+    
+    async def on_new_message(event):
+        if not await client.is_user_authorized(): return
+        st = state.get(name, {})
+        
+        # Auto-reply logic
+        if st.get("auto_reply") and event.is_private and not event.out:
+            try:
+                trigger = (st.get("trigger") or "").lower()
+                reply_text = st.get("reply") or ""
                 text = (event.raw_text or "").lower()
-                if trig and trig in text and rep:
-                    try:
-                        await event.respond(rep)
-                    except Exception:
-                        pass
-            if st.get("auto_read") and event.is_private:
+                if trigger and trigger in text and reply_text:
+                    await event.respond(reply_text) 
+            except Exception: pass
+        
+        # Auto-read logic
+        if st.get("auto_read") and event.is_private and not event.out:
+            try:
                 mid = getattr(event.message, "id", None)
                 if mid is not None:
-                    try:
-                        peer = await event.get_input_chat()
-                    except Exception:
-                        try:
-                            peer = await event.get_input_sender()
-                        except Exception:
-                            peer = None
-                    if peer is not None:
-                        try:
-                            await client(functions.messages.ReadHistoryRequest(peer=peer, max_id=mid))
-                        except Exception:
-                            try:
-                                await client.send_read_acknowledge(peer, max_id=mid)
-                            except Exception:
-                                try:
-                                    await event.message.mark_read()
-                                except Exception:
-                                    pass
-        except Exception:
-            pass
+                    peer = event.input_chat 
+                    await client(functions.messages.ReadHistoryRequest(peer=peer, max_id=mid))
+            except Exception: pass
+                
+    return on_new_message
 
-# ---------------- permission checks ----------------
-def is_owner_or_admin(user_id: int, session_idx: int) -> bool:
-    if user_id in ADMINS:
-        return True
-    with _wrappers_lock:
-        if 0 <= session_idx < len(session_names):
-            sess = session_names[session_idx]
-            with _state_lock:
-                st = state_store.get(sess, {})
-            owner = st.get("owner_user_id")
-            if owner is not None and int(owner) == int(user_id):
-                return True
-    return False
+# --------------------------
+# Bot Functions (Menus and Handlers)
+# --------------------------
 
-def has_access(user_id:int, session_idx:int) -> bool:
-    if is_owner_or_admin(user_id, session_idx):
-        return True
-    with _allowed_lock:
-        allowed = allowed_sessions_per_user.get(int(user_id), [])
-        return session_idx in allowed
+def get_main_menu_keyboard(chat_id: str) -> InlineKeyboardMarkup:
+    """Generates the main menu keyboard, ensuring account buttons are always visible for all users."""
+    
+    is_admin = str(chat_id) == str(ADMIN_ID)
+    
+    keyboard = [
+        [InlineKeyboardButton("➕ Добавить аккаунт", callback_data="menu_add_acc")],
+    ]
+    
+    # 1. Управление аккаунтами - ВСЕГДА ВИДНЫ
+    if is_admin:
+        # Админ всегда видит управление ВСЕМИ аккаунтами
+        keyboard.append([InlineKeyboardButton("⚙️ Управление ВСЕМИ аккаунтами (Admin)", callback_data="menu_select_acc")])
+    else:
+        # Обычный пользователь всегда видит управление СВОИМ аккаунтом
+        keyboard.append([InlineKeyboardButton("⚙️ Управление аккаунтами", callback_data="menu_select_acc")])
+    
+    # 2. Список аккаунтов и смена пароля - ВСЕГДА ВИДНЫ
+    keyboard.append([InlineKeyboardButton("📄 Мой список аккаунтов", callback_data="menu_list_acc")])
+    keyboard.append([InlineKeyboardButton("🔑 Сменить пароль доступа", callback_data="menu_change_pwd")])
 
-# ---------------- entity resolution ----------------
-def resolve_entity(wrapper: ClientWrapper, peer: str, timeout: float = 20.0):
-    peer = peer.strip()
-    if not peer:
-        raise ValueError("Empty peer")
-    if peer.startswith("http://") or peer.startswith("https://"):
-        peer = peer.rstrip("/").split("/")[-1]
-    # numeric id
-    try:
-        nid = int(peer)
-        return nid
-    except Exception:
-        pass
-    if not wrapper.client:
-        raise RuntimeError("Client not ready")
-    fut = wrapper.run_coro(wrapper.client.get_entity(peer))
-    return fut.result(timeout=timeout)
+    return InlineKeyboardMarkup(keyboard)
 
-# ---------------- TeleBot handlers ----------------
-@bot.message_handler(commands=["start"])
-def cmd_start(m):
-    bot.send_message(m.chat.id, "Управление TG-аккаунтами. Выберите:", reply_markup=main_kb(m.from_user.id))
 
-@bot.message_handler(func=lambda m: m.text == "ℹ️ Помощь")
-def cmd_help(m):
-    txt = ("Инструкция:\n"
-           "• ➕ Добавить аккаунт — добавить по номеру (бот попросит код)\n"
-           "• 📂 Аккаунты — список с подменю\n"
-           "Владелец аккаунта — тот, кто добавил номер. Только владелец и админы имеют полный доступ.")
-    bot.send_message(m.chat.id, txt)
+def get_account_selection_keyboard(chat_id: str, prefix: str) -> InlineKeyboardMarkup | None:
+    """Generates keyboard for account selection with a specific callback prefix. 
+    
+    ВАЖНО: Теперь эта функция всегда возвращает список всех загруженных аккаунтов, 
+    если пользователь - не админ, он выбирает любой, но должен ввести пароль.
+    """
+    
+    is_admin = str(chat_id) == str(ADMIN_ID)
+    
+    # ВСЕГДА показываем ВСЕ загруженные сессии.
+    sessions_to_show = loaded_clients.keys()
 
-@bot.message_handler(func=lambda m: m.text == "➕ Добавить аккаунт")
-def msg_add_account(m):
-    bot.send_message(m.chat.id, "Введите номер телефона в формате +7...")
-    set_fsm(m.from_user.id, "adding_phone")
-
-@bot.message_handler(func=lambda m: m.text == "📂 Аккаунты")
-def msg_accounts(m):
-    bot.send_message(m.chat.id, "Аккаунты:", reply_markup=accounts_kb())
-
-@bot.message_handler(func=lambda m: m.text == "⚙️ Админ")
-def msg_admin(m):
-    if m.from_user.id not in ADMINS:
-        bot.send_message(m.chat.id, "Доступно только админам.")
-        return
-    kb = types.InlineKeyboardMarkup()
-    with _wrappers_lock:
-        for i, name in enumerate(session_names,1):
-            kb.add(types.InlineKeyboardButton(f"{i}. {name}", callback_data=f"admin_acc:{i-1}"))
-    kb.add(types.InlineKeyboardButton("Обновить", callback_data="admin_refresh"))
-    bot.send_message(m.chat.id, "Admin: список сессий", reply_markup=kb)
-
-@bot.callback_query_handler(func=lambda c: True)
-def cb_handler(call):
-    data = call.data or ""
-    chat_id = call.message.chat.id
-    user_id = call.from_user.id
-    try:
-        if data == "back_accounts":
-            try:
-                bot.edit_message_text("Аккаунты:", chat_id, call.message.message_id, reply_markup=accounts_kb())
-            except apihelper.ApiTelegramException:
-                pass
-            return
-
-        if data == "add_account":
-            bot.send_message(chat_id, "Введите номер телефона в формате +7...")
-            set_fsm(user_id, "adding_phone")
-            return
-
-        if data.startswith("admin_refresh"):
-            if user_id not in ADMINS:
-                bot.answer_callback_query(call.id, "Access denied")
-                return
-            try:
-                bot.edit_message_text("Admin: список сессий", chat_id, call.message.message_id, reply_markup=call.message.reply_markup)
-            except Exception:
-                pass
-            return
-
-        if data.startswith("admin_acc:"):
-            if user_id not in ADMINS:
-                bot.answer_callback_query(call.id, "Access denied")
-                return
-            idx = int(data.split(":",1)[1])
-            with _wrappers_lock:
-                if not (0 <= idx < len(wrappers)):
-                    bot.answer_callback_query(call.id, "Аккаунт не найден")
-                    return
-            kb = types.InlineKeyboardMarkup(row_width=2)
-            kb.add(types.InlineKeyboardButton("ℹ️ Info", callback_data=f"info:{idx}"),
-                   types.InlineKeyboardButton("Выйти со всех устройств", callback_data=f"logout_all:{idx}"))
-            kb.add(types.InlineKeyboardButton("Удалить локальную сессию", callback_data=f"remove_local:{idx}"))
-            kb.add(types.InlineKeyboardButton("Использовать аккаунт", callback_data=f"use_as_admin:{idx}"))
-            kb.add(types.InlineKeyboardButton("🔙 Назад", callback_data="admin_refresh"))
-            try:
-                bot.edit_message_text(f"Admin: <b>{sanitize(session_names[idx])}</b>", chat_id, call.message.message_id, reply_markup=kb)
-            except apihelper.ApiTelegramException:
-                pass
-            return
-
-        if data.startswith("use_as_admin:"):
-            idx = int(data.split(":",1)[1])
-            if user_id not in ADMINS:
-                bot.answer_callback_query(call.id, "Access denied")
-                return
-            with _allowed_lock:
-                # avoid duplicates
-                lst = allowed_sessions_per_user.setdefault(user_id, [])
-                if idx not in lst:
-                    lst.append(idx)
-            try:
-                bot.edit_message_text(f"Меню аккаунта (admin): <b>{sanitize(session_names[idx])}</b>", chat_id, call.message.message_id, reply_markup=account_menu_kb(idx, limited=False))
-            except apihelper.ApiTelegramException:
-                pass
-            return
-
-        if data.startswith("acc:"):
-            idx = int(data.split(":",1)[1])
-            with _wrappers_lock:
-                if not (0 <= idx < len(wrappers)):
-                    bot.answer_callback_query(call.id, "Аккаунт не найден")
-                    return
-            if has_access(user_id, idx):
-                limited = not is_owner_or_admin(user_id, idx)
-                try:
-                    bot.edit_message_text(f"Меню аккаунта: <b>{sanitize(session_names[idx])}</b>", chat_id, call.message.message_id, reply_markup=account_menu_kb(idx, limited=limited))
-                except apihelper.ApiTelegramException:
-                    pass
-                return
-            # require password for non-owner/non-admin
-            with _state_lock:
-                sess = session_names[idx]
-                st = state_store.get(sess, {})
-                pwd = st.get("password","")
-            if pwd:
-                set_fsm(user_id, "auth_password", {"idx": idx})
-                bot.send_message(chat_id, "Установлен пароль. Введите пароль для доступа к аккаунту:")
-                return
-            bot.answer_callback_query(call.id, "Доступ запрещён. Обратитесь к владельцу или администратору.")
-            return
-
-        # per-account commands
-        if data.startswith(("contacts:","chats:","groups:","info:","logout:","remove_local:","logout_all:","show_last:")):
-            cmd, sidx = data.split(":",1)
-            idx = int(sidx)
-            with _wrappers_lock:
-                if not (0 <= idx < len(wrappers)):
-                    bot.answer_callback_query(call.id, "Аккаунт не найден")
-                    return
-            if cmd in ("contacts","chats","groups","show_last"):
-                if not has_access(user_id, idx):
-                    bot.answer_callback_query(call.id, "Нет доступа к этой операции")
-                    return
-            wrapper = wrappers[idx]
-            if cmd == "contacts":
-                try:
-                    fut = wrapper.run_coro(wrapper.client(functions.contacts.GetContactsRequest(hash=0)))
-                    res = fut.result(timeout=20)
-                    users = getattr(res, "users", []) or []
-                    lines = [f"- {getattr(u,'first_name','')} {getattr(u,'last_name','')} | id={u.id} | @{getattr(u,'username',None) or ''}" for u in users]
-                    text = "\n".join(lines) or "Нет контактов."
-                    try:
-                        bot.edit_message_text(f"<pre>{sanitize(text)[:4000]}</pre>", chat_id, call.message.message_id, reply_markup=account_menu_kb(idx, limited=not is_owner_or_admin(user_id, idx)))
-                    except apihelper.ApiTelegramException:
-                        pass
-                except Exception as e:
-                    bot.answer_callback_query(call.id, f"Ошибка: {e}")
-                return
-            if cmd == "chats":
-                async def collect():
-                    out=[]
-                    async for d in wrapper.client.iter_dialogs(limit=50):
-                        nm = getattr(d, "name", None) or getattr(d.entity, "title", None) or ""
-                        out.append(f"- {nm} | id={d.id}")
-                    return out
-                try:
-                    lines = wrapper.run_coro(collect()).result(timeout=20)
-                    text = "\n".join(lines) or "Нет диалогов."
-                    try:
-                        bot.edit_message_text(f"<pre>{sanitize(text)[:4000]}</pre>", chat_id, call.message.message_id, reply_markup=account_menu_kb(idx, limited=not is_owner_or_admin(user_id, idx)))
-                    except apihelper.ApiTelegramException:
-                        pass
-                except Exception as e:
-                    bot.answer_callback_query(call.id, f"Ошибка: {e}")
-                return
-            if cmd == "groups":
-                async def collectg():
-                    out=[]
-                    async for d in wrapper.client.iter_dialogs(limit=200):
-                        if d.is_group or d.is_channel:
-                            nm = getattr(d, "name", None) or getattr(d.entity, "title", None) or ""
-                            out.append(f"- {nm} | id={d.id} | is_channel={d.is_channel} | is_group={d.is_group}")
-                    return out
-                try:
-                    lines = wrapper.run_coro(collectg()).result(timeout=30)
-                    text = "\n".join(lines) or "Нет групп/каналов."
-                    try:
-                        bot.edit_message_text(f"<pre>{sanitize(text)[:4000]}</pre>", chat_id, call.message.message_id, reply_markup=account_menu_kb(idx, limited=not is_owner_or_admin(user_id, idx)))
-                    except apihelper.ApiTelegramException:
-                        pass
-                except Exception as e:
-                    bot.answer_callback_query(call.id, f"Ошибка: {e}")
-                return
-            if cmd == "info":
-                try:
-                    me = wrapper.run_coro(wrapper.client.get_me()).result(timeout=10)
-                    started = "running" if wrapper.thread and wrapper.thread.is_alive() else "stopped"
-                    text = (f"Session: {wrapper.session_path}\nStarted: {started}\nAccount ID: {me.id}\nUsername: {getattr(me,'username',None)}\nName: {getattr(me,'first_name','')} {getattr(me,'last_name','')}")
-                    try:
-                        bot.edit_message_text(f"<pre>{sanitize(text)}</pre>", chat_id, call.message.message_id, reply_markup=account_menu_kb(idx, limited=not is_owner_or_admin(user_id, idx)))
-                    except apihelper.ApiTelegramException:
-                        pass
-                except Exception as e:
-                    bot.answer_callback_query(call.id, f"Ошибка: {e}")
-                return
-            if cmd == "logout":
-                try:
-                    bot.edit_message_text("Выберите действие: ⤵️", chat_id, call.message.message_id, reply_markup=types.InlineKeyboardMarkup().add(
-                        types.InlineKeyboardButton("Выйти со всех устройств", callback_data=f"logout_all:{idx}"),
-                        types.InlineKeyboardButton("🔙 Назад", callback_data=f"acc:{idx}")
-                    ))
-                except apihelper.ApiTelegramException:
-                    pass
-                return
-            if cmd == "remove_local":
-                if not is_owner_or_admin(user_id, idx):
-                    bot.answer_callback_query(call.id, "Нет доступа")
-                    return
-                ok = remove_local_session_by_idx(idx)
-                if ok:
-                    try:
-                        bot.edit_message_text("Локальная сессия удалена.", chat_id, call.message.message_id, reply_markup=accounts_kb())
-                    except apihelper.ApiTelegramException:
-                        pass
-                else:
-                    bot.answer_callback_query(call.id, "Ошибка удаления")
-                return
-            if cmd == "logout_all":
-                if not is_owner_or_admin(user_id, idx):
-                    bot.answer_callback_query(call.id, "Нет доступа")
-                    return
-                try:
-                    wrappers[idx].run_coro(wrappers[idx].client(functions.auth.ResetAuthorizationsRequest())).result(timeout=10)
-                    bot.answer_callback_query(call.id, "Вышел со всех устройств")
-                except Exception as e:
-                    bot.answer_callback_query(call.id, f"Ошибка: {e}")
-                return
-            if cmd == "show_last":
-                # ask for peer id/username
-                set_fsm(user_id, "show_last_await_peer", {"idx": idx})
-                bot.send_message(chat_id, "Введите username или id чата, чтобы получить 5 последних сообщений:")
-                return
-
-        # set password / skip after adding account
-        if data.startswith(("set_pwd:","skip_pwd:")):
-            cmd, sidx = data.split(":",1)
-            idx = int(sidx)
-            with _wrappers_lock:
-                if not (0 <= idx < len(wrappers)):
-                    bot.answer_callback_query(call.id, "Аккаунт не найден")
-                    return
-            if cmd == "skip_pwd":
-                bot.answer_callback_query(call.id, "Пропущено")
-                return
-            if cmd == "set_pwd":
-                set_fsm(user_id, "set_account_password", {"idx": idx})
-                bot.send_message(chat_id, "Введите пароль для сессии:")
-                return
-
-        # auto-reply toggles (owner/admin only)
-        if any(data.startswith(p) for p in ("ar_on:","ar_off:","ard_on:","ard_off:")):
-            cmd, sidx = data.split(":",1)
-            idx = int(sidx)
-            if not is_owner_or_admin(user_id, idx):
-                bot.answer_callback_query(call.id, "Нет доступа")
-                return
-            with _state_lock:
-                name = session_names[idx]
-                st = state_store.setdefault(name, {"auto_reply": False, "trigger": "", "reply": "", "auto_read": False, "password":"", "owner_user_id": None})
-            if cmd == "ar_on":
-                set_fsm(user_id, "ar_set_trigger", {"idx": idx})
-                bot.send_message(chat_id, "Введите триггер (подстрока):")
-            elif cmd == "ar_off":
-                with _state_lock:
-                    st["auto_reply"] = False
-                    _safe_write_state()
-                bot.answer_callback_query(call.id, "AutoReply выключен")
-                try:
-                    bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=account_menu_kb(idx))
-                except apihelper.ApiTelegramException:
-                    pass
-            elif cmd == "ard_on":
-                with _state_lock:
-                    st["auto_read"] = True
-                    _safe_write_state()
-                bot.answer_callback_query(call.id, "AutoRead включён")
-                try:
-                    bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=account_menu_kb(idx))
-                except apihelper.ApiTelegramException:
-                    pass
-            elif cmd == "ard_off":
-                with _state_lock:
-                    st["auto_read"] = False
-                    _safe_write_state()
-                bot.answer_callback_query(call.id, "AutoRead выключен")
-                try:
-                    bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=account_menu_kb(idx))
-                except apihelper.ApiTelegramException:
-                    pass
-            return
-
-        bot.answer_callback_query(call.id, "Действие не реализовано")
-    except Exception as e:
-        try:
-            bot.answer_callback_query(call.id, f"Ошибка: {e}", show_alert=True)
-        except Exception:
-            pass
-
-# ---------------- FSM message handler ----------------
-@bot.message_handler(func=lambda m: get_fsm(m.from_user.id) is not None)
-def fsm_handler(m):
-    user_id = m.from_user.id
-    st = get_fsm(user_id)
-    if not st:
-        return
-    name = st["state"]
-    data = st.get("data", {})
-
-    # adding phone -> create pending wrapper, send code
-    if name == "adding_phone":
-        phone = m.text.strip()
-        if not phone.startswith("+"):
-            bot.send_message(m.chat.id, "Неверный формат. Должен начинаться с +. Попробуйте ещё раз.")
-            return
-        global pending_next
-        pending_name = phone.replace("+","").replace(" ","").replace("-","")
-        wrapper = ClientWrapper(pending_name)
-        wrapper.start_thread()
-        with _pending_lock:
-            pending_id = pending_next
-            pending_next += 1
-            pending_wrappers[pending_id] = {"wrapper": wrapper, "owner_id": int(user_id), "phone": phone}
-        try:
-            fut = wrapper.run_coro(wrapper.client.send_code_request(phone))
-            fut.result(timeout=20)
-            set_fsm(user_id, "await_code", {"pending_id": pending_id, "phone": phone})
-            bot.send_message(m.chat.id, f"Код отправлен на {phone}. Введите код:")
-        except Exception as e:
-            bot.send_message(m.chat.id, f"Ошибка отправки кода: {e}")
-            try:
-                wrapper.disconnect()
-            except Exception:
-                pass
-            with _pending_lock:
-                pending_wrappers.pop(pending_id, None)
-            clear_fsm(user_id)
-        return
-
-    # await code
-    if name == "await_code":
-        code = m.text.strip()
-        pending_id = data.get("pending_id")
-        with _pending_lock:
-            pending = pending_wrappers.get(pending_id)
-        if not pending:
-            bot.send_message(m.chat.id, "Внутренняя ошибка. Повторите добавление.")
-            clear_fsm(user_id)
-            return
-        wrapper = pending["wrapper"]
-        phone = pending["phone"]
-        owner_id = pending["owner_id"]
-        try:
-            fut = wrapper.run_coro(wrapper.client.sign_in(phone, code))
-            try:
-                fut.result(timeout=30)
-            except Exception as e:
-                cause = getattr(e, "__cause__", None)
-                if isinstance(cause, SessionPasswordNeededError) or "password" in str(e).lower() or "2fa" in str(e).lower():
-                    set_fsm(user_id, "await_2fa", {"pending_id": pending_id, "owner_id": owner_id})
-                    bot.send_message(m.chat.id, "Требуется пароль 2FA. Введите пароль:")
-                    return
-                else:
-                    raise
-            idx = finalize_authorized_wrapper(wrapper, owner_user_id=owner_id)
-            with _pending_lock:
-                pending_wrappers.pop(pending_id, None)
-            bot.send_message(m.chat.id, f"Аккаунт добавлен и авторизован. Индекс: {idx}")
-            bot.send_message(m.chat.id, "Хотите установить пароль для доступа к этой сессии?", reply_markup=password_choice_kb(idx))
-            clear_fsm(user_id)
-            return
-        except Exception as e:
-            bot.send_message(m.chat.id, f"Ошибка входа: {e}")
-            try:
-                wrapper.disconnect()
-            except Exception:
-                pass
-            with _pending_lock:
-                pending_wrappers.pop(pending_id, None)
-            clear_fsm(user_id)
-        return
-
-    # await 2fa
-    if name == "await_2fa":
-        pwd = m.text.strip()
-        pending_id = data.get("pending_id")
-        owner_id = data.get("owner_id", user_id)
-        with _pending_lock:
-            pending = pending_wrappers.get(pending_id)
-        if not pending:
-            bot.send_message(m.chat.id, "Внутренняя ошибка. Повторите добавление.")
-            clear_fsm(user_id)
-            return
-        wrapper = pending["wrapper"]
-        try:
-            wrapper.run_coro(wrapper.client.sign_in(password=pwd)).result(timeout=30)
-            idx = finalize_authorized_wrapper(wrapper, owner_user_id=owner_id)
-            with _pending_lock:
-                pending_wrappers.pop(pending_id, None)
-            bot.send_message(m.chat.id, f"2FA пройдена. Аккаунт добавлен. Индекс: {idx}")
-            bot.send_message(m.chat.id, "Хотите установить пароль для доступа к этой сессии?", reply_markup=password_choice_kb(idx))
-            clear_fsm(user_id)
-        except Exception as e:
-            bot.send_message(m.chat.id, f"Ошибка 2FA: {e}")
-            try:
-                wrapper.disconnect()
-            except Exception:
-                pass
-            with _pending_lock:
-                pending_wrappers.pop(pending_id, None)
-            clear_fsm(user_id)
-        return
-
-    # set account password after adding
-    if name == "set_account_password":
-        pwd = m.text.strip()
-        idx = data.get("idx")
-        with _wrappers_lock:
-            if idx is None or not (0 <= idx < len(session_names)):
-                bot.send_message(m.chat.id, "Внутренняя ошибка.")
-                clear_fsm(user_id)
-                return
-            sess = session_names[idx]
-        with _state_lock:
-            state_store.setdefault(sess, {"auto_reply": False, "trigger": "", "reply": "", "auto_read": False, "password":"", "owner_user_id": None})
-            state_store[sess]["password"] = hash_password(pwd)
-            _safe_write_state()
-        bot.send_message(m.chat.id, "Пароль установлен.")
-        clear_fsm(user_id)
-        return
-
-    # auth by password to access an account
-    if name == "auth_password":
-        pwd = m.text.strip()
-        idx = data.get("idx")
-        with _wrappers_lock:
-            if idx is None or not (0 <= idx < len(session_names)):
-                bot.send_message(m.chat.id, "Внутренняя ошибка.")
-                clear_fsm(user_id)
-                return
-            sess = session_names[idx]
-        with _state_lock:
-            st = state_store.get(sess,{})
-            stored = st.get("password","")
-        if stored and verify_password(stored, pwd):
-            with _allowed_lock:
-                allowed_sessions_per_user.setdefault(int(user_id), []).append(idx)
-            bot.send_message(m.chat.id, "Пароль корректен. Доступ предоставлен.")
-            try:
-                bot.send_message(m.chat.id, f"Меню аккаунта: <b>{sanitize(sess)}</b>", reply_markup=account_menu_kb(idx, limited=not is_owner_or_admin(user_id, idx)))
-            except Exception:
-                pass
-        else:
-            bot.send_message(m.chat.id, "Неверный пароль.")
-        clear_fsm(user_id)
-        return
-
-    # set auto-reply trigger
-    if name == "ar_set_trigger":
-        trig = m.text.strip()
-        idx = data.get("idx")
-        if not is_owner_or_admin(user_id, idx):
-            bot.send_message(m.chat.id, "Нет доступа.")
-            clear_fsm(user_id)
-            return
-        with _wrappers_lock:
-            sess = session_names[idx]
-        with _state_lock:
-            st = state_store.setdefault(sess, {"auto_reply": False, "trigger": "", "reply": "", "auto_read": False, "password":"", "owner_user_id": None})
-            st["trigger"] = trig
-        set_fsm(user_id, "ar_set_reply", {"idx": idx})
-        bot.send_message(m.chat.id, "Введите текст автоответа:")
-        return
-
-    if name == "ar_set_reply":
-        reply = m.text
-        idx = data.get("idx")
-        with _wrappers_lock:
-            sess = session_names[idx]
-        with _state_lock:
-            st = state_store.setdefault(sess, {"auto_reply": False, "trigger": "", "reply": "", "auto_read": False, "password":"", "owner_user_id": None})
-            st["reply"] = reply
-            st["auto_reply"] = True
-            _safe_write_state()
-        bot.send_message(m.chat.id, "AutoReply включён.")
-        clear_fsm(user_id)
-        return
-
-    # generic send flows
-    if name.endswith("_await_peer"):
-        cmd = name.split("_await_peer")[0]
-        idx = data.get("idx")
-        if idx is None:
-            bot.send_message(m.chat.id, "Внутренняя ошибка: не указан аккаунт.")
-            clear_fsm(user_id)
-            return
-        peer = m.text.strip()
-        data["peer"] = peer
-        set_fsm(user_id, f"{cmd}_await_text", data)
-        if cmd in ("send_file","send_photo"):
-            bot.send_message(m.chat.id, "Укажите путь к файлу на сервере:")
-        elif cmd == "broadcast":
-            bot.send_message(m.chat.id, "Введите текст рассылки:")
-        elif cmd == "schedule":
-            bot.send_message(m.chat.id, "Введите текст для отправки:")
-        else:
-            bot.send_message(m.chat.id, "Введите текст сообщения:")
-        return
-
-    if name.endswith("_await_text"):
-        cmd = name.split("_await_text")[0]
-        data["text"] = m.text
-        idx = data.get("idx")
-        peer = data.get("peer")
-        with _wrappers_lock:
-            if idx is None or not (0 <= idx < len(wrappers)):
-                bot.send_message(m.chat.id, "Аккаунт не найден.")
-                clear_fsm(user_id)
-                return
-            wrapper = wrappers[idx]
-        try:
-            entity = resolve_entity(wrapper, peer)
-            if cmd == "send":
-                wrapper.run_coro(wrapper.client.send_message(entity, data["text"])).result(timeout=20)
-                bot.send_message(m.chat.id, "✅ Отправлено.")
-            elif cmd in ("send_file", "send_photo"):
-                path = data["text"].strip()
-                wrapper.run_coro(wrapper.client.send_file(entity, path)).result(timeout=60)
-                bot.send_message(m.chat.id, "✅ Файл отправлен.")
-            elif cmd == "broadcast":
-                contacts = wrapper.run_coro(wrapper.client(functions.contacts.GetContactsRequest(hash=0))).result(timeout=30)
-                users = getattr(contacts, "users", []) or []
-                sent = 0
-                for u in users:
-                    try:
-                        wrapper.run_coro(wrapper.client.send_message(u.id, data["text"])).result(timeout=10)
-                        sent += 1
-                        time.sleep(0.2)
-                    except Exception:
-                        pass
-                bot.send_message(m.chat.id, f"Рассылка завершена. Отправлено: {sent}")
-            elif cmd == "schedule":
-                set_fsm(m.user.id, "schedule_await_delay", data)
-                bot.send_message(m.chat.id, "Через сколько секунд отправить? (число)")
-                return
-        except Exception as e:
-            bot.send_message(m.chat.id, f"Ошибка: {e}")
-        clear_fsm(user_id)
-        return
-
-    if name == "schedule_await_delay":
-        data = st["data"]
-        idx = data["idx"]
-        peer = data["peer"]
-        text = data["text"]
-        try:
-            delay = int(m.text.strip())
-        except Exception:
-            delay = 0
-        with _wrappers_lock:
-            wrapper = wrappers[idx]
-        def delayed_send():
-            time.sleep(delay)
-            try:
-                ent = resolve_entity(wrapper, peer)
-                wrapper.run_coro(wrapper.client.send_message(ent, text)).result(timeout=30)
-            except Exception:
-                pass
-        threading.Thread(target=delayed_send, daemon=True).start()
-        bot.send_message(m.chat.id, f"Запланировано через {delay} сек.")
-        clear_fsm(user_id)
-        return
-
-    # show last 5 messages flow
-    if name == "show_last_await_peer":
-        idx = data.get("idx")
-        peer = m.text.strip()
-        with _wrappers_lock:
-            if idx is None or not (0 <= idx < len(wrappers)):
-                bot.send_message(m.chat.id, "Аккаунт не найден.")
-                clear_fsm(user_id)
-                return
-            wrapper = wrappers[idx]
-        try:
-            ent = resolve_entity(wrapper, peer)
-            msgs = wrapper.run_coro(wrapper.client.get_messages(ent, limit=5)).result(timeout=20)
-            lines = []
-            for mm in reversed(msgs):
-                txt = getattr(mm, "message", "") or ""
-                sender = getattr(mm, "sender_id", None)
-                t = getattr(mm, "date", None)
-                lines.append(f"[{sender}] {t} : {txt}")
-            text = "\n".join(lines) or "Нет сообщений."
-            bot.send_message(m.chat.id, f"<pre>{sanitize(text)[:4000]}</pre>")
-        except Exception as e:
-            bot.send_message(m.chat.id, f"Ошибка получения сообщений: {e}")
-        clear_fsm(user_id)
-        return
-
-    # fallback
-    bot.send_message(m.chat.id, "Неизвестное состояние. Сброс.")
-    clear_fsm(user_id)
-
-# ---------------- restore existing sessions on startup ----------------
-def restore_sessions():
-    # find base names assuming Telethon uses files like sessions/<name>.session or sessions/<name>
-    files = os.listdir(SESSIONS_DIR)
-    bases = set()
-    for fname in files:
-        base, ext = os.path.splitext(fname)
-        if base:
-            bases.add(base)
-    for base in sorted(bases):
-        if base in session_names:
-            continue
-        try:
-            w = ClientWrapper(base)
-            w.start_thread()
-            # small wait to let client init
-            time.sleep(0.1)
-            if w.is_authorized(timeout=3):
-                finalize_authorized_wrapper(w)
+    if not sessions_to_show:
+        return None
+        
+    keyboard = []
+    account_names = sorted(list(sessions_to_show))
+    
+    for i in range(0, len(account_names), 2):
+        row = []
+        for name in account_names[i:i+2]:
+            me_info = meta.get(name, {}).get("me")
+            uname = getattr(me_info, 'username', name)
+            
+            # Статус теперь показывает:
+            # 👑: Админ
+            # 🔓: Обычный пользователь, у которого есть текущий доступ по времени (для prefix="act")
+            # 🔑: Аккаунт защищен локальным паролем (для prefix="act")
+            # ⚠️: Аккаунт не защищен локальным паролем (НОВЫЙ СТАТУС, чтобы избежать ошибки)
+            
+            if is_admin:
+                 status = "👑" 
             else:
-                try:
-                    w.disconnect()
-                except Exception:
-                    pass
-        except Exception:
-            try:
-                w.disconnect()
-            except Exception:
-                pass
+                 is_protected = name in passwords
+                 is_accessible = check_access_validity(chat_id, name)
+                 
+                 if is_accessible and prefix == "act":
+                     status = "🔓"
+                 elif is_protected:
+                     status = "🔑"
+                 else:
+                     status = "⚠️" # Аккаунт не привязан к паролю. Доступ будет невозможен.
+                 
+            row.append(InlineKeyboardButton(f"{status} @{uname}", callback_data=f"{prefix}_{name}"))
+        keyboard.append(row)
+        
+    keyboard.append([InlineKeyboardButton("⬅️ Назад в меню", callback_data="menu_main")])
+    return InlineKeyboardMarkup(keyboard)
 
-restore_sessions()
 
-# ---------------- run bot ----------------
-if __name__ == "__main__":
-    print("TG accounts manager bot running...")
+async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, message_text: str = None):
+    """Sends the main menu, either as a new message or by editing the current one."""
+    chat_id = str(update.effective_chat.id if update.effective_chat else context.user_data.get('chat_id'))
+    if not chat_id: return
+
+    is_admin = chat_id == str(ADMIN_ID)
+    
+    keyboard = get_main_menu_keyboard(chat_id)
+    text = message_text or "👋 **Главное меню.** Выберите действие:"
+    
+    if is_admin:
+        text = f"👑 **[ADMIN MODE]** Выберите действие для управления {len(loaded_clients)} аккаунтами."
+
+    if update.callback_query:
+        query = update.callback_query
+        await query.answer()
+        try:
+            await query.edit_message_text(text=text, reply_markup=keyboard, parse_mode='Markdown')
+        except Exception: 
+             # В случае ошибки редактирования (например, если сообщение старое), отправляем новое
+             await query.message.reply_text(text=text, reply_markup=keyboard, parse_mode='Markdown')
+    elif update.message:
+        await update.message.reply_text(text=text, reply_markup=keyboard, parse_mode='Markdown')
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the /start command."""
+    context.user_data['chat_id'] = str(update.effective_chat.id)
+    await main_menu(update, context, "👋 **Добро пожаловать!** Используйте кнопки для управления аккаунтами.")
+
+# --------------------------
+# Menu Handlers (CallbackQueryHandler)
+# --------------------------
+
+async def handle_menu_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Routes main menu callback queries."""
+    query = update.callback_query
+    data = query.data
+    await query.answer()
+    
+    if data == "menu_main":
+        return await main_menu(update, context)
+
+    if data == "menu_list_acc":
+        return await list_all_accounts_for_all(update, context) # Скорректированная функция
+
+    if data == "menu_add_acc":
+        await query.edit_message_text("📲 **Шаг 1/4:** Введите номер телефона с международным префиксом (напр. `+15551234567`):")
+        return ADD_PHONE
+        
+    if data == "menu_select_acc":
+        chat_id = str(query.message.chat_id)
+        keyboard = get_account_selection_keyboard(chat_id, prefix="act")
+        
+        is_admin = chat_id == str(ADMIN_ID)
+        
+        if not keyboard:
+            await query.edit_message_text("❌ В боте нет загруженных аккаунтов для управления.")
+            return await main_menu(update, context)
+
+        text = "👑 **[ADMIN MODE]** Выберите аккаунт для управления:" if is_admin else "👉 **Выберите аккаунт** и введите пароль для доступа (🔓 = доступен сейчас):"
+        
+        await query.edit_message_text(text, reply_markup=keyboard)
+        return SELECT_ACCOUNT
+        
+    if data == "menu_change_pwd":
+        chat_id = str(query.message.chat_id)
+        # Для смены пароля показываем только те аккаунты, которые привязаны к чату (или все, если админ)
+        keyboard = get_account_selection_keyboard(chat_id, prefix="chg") 
+        
+        if not keyboard:
+            await query.edit_message_text("❌ Нет аккаунтов, привязанных к этому чату, для смены пароля.")
+            return await main_menu(update, context)
+
+        await query.edit_message_text("🔐 Выберите аккаунт для **смены** локального пароля доступа:", reply_markup=keyboard)
+        return PASS_SELECT_CHANGE
+        
+    return ConversationHandler.END
+
+async def list_all_accounts_for_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lists all accounts loaded in the bot for ALL users."""
+    query = update.callback_query
+    chat_id = str(query.message.chat_id)
+    is_admin = chat_id == str(ADMIN_ID)
+    
+    sessions_to_list = loaded_clients.keys()
+    
+    response = ["📄 **Список ВСЕХ загруженных аккаунтов в боте:**"]
+    
+    if not sessions_to_list:
+        response = ["❌ В боте нет загруженных аккаунтов."]
+    else:
+        for name in sessions_to_list:
+            me_info = meta.get(name, {}).get("me", "Unknown User")
+            uname = getattr(me_info, 'username', 'N/A')
+            
+            if is_admin:
+                access_status = "👑 ADMIN"
+            else:
+                 # Показываем, есть ли пароль.
+                 access_status = "🔑 Пароль Требуется" if name in passwords else "⚠️ Нет пароля"
+                 
+            response.append(f"- **{name}** (@{uname}) | Статус: Активен | Доступ: {access_status}")
+        
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад в меню", callback_data="menu_main")]])
+    await query.edit_message_text(text="\n".join(response), reply_markup=keyboard, parse_mode='Markdown')
+
+# --------------------------
+# Add Account Conversation
+# --------------------------
+async def add_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    phone = update.message.text.strip()
+    session_name = phone.replace("+", "").strip()
+    session_path = os.path.join(SESSION_DIR, session_name)
+    
+    if session_name in loaded_clients:
+        client = loaded_clients[session_name]
+    else:
+        client = TelegramClient(session_path, DEFAULT_API_ID, DEFAULT_API_HASH)
+        try:
+            await client.connect()
+            loaded_clients[session_name] = client
+        except Exception as e:
+            await update.message.reply_text(f"❌ Ошибка подключения: `{e}`")
+            return await cancel_return_to_menu(update, context)
+            
+    context.user_data['client'] = client
+    context.user_data['phone'] = phone
+    context.user_data['session_name'] = session_name
+    
     try:
-        bot.infinity_polling(timeout=60, long_polling_timeout=60)
-    except KeyboardInterrupt:
-        print("Stopped by user")
+        if not await client.is_user_authorized():
+            await client.send_code_request(phone)
+            await update.message.reply_text(f"🔢 **Шаг 2/4:** Введите код, отправленный на `{phone}`:")
+            return ADD_CODE
+        else:
+            await update.message.reply_text(f"✅ Аккаунт `{session_name}` уже авторизован. Введите **локальный пароль доступа** (для управления из этого чата):")
+            return SET_PASSWORD
     except Exception as e:
-        print("Polling stopped:", e)
+        await update.message.reply_text(f"❌ Ошибка при отправке номера: `{e}`")
+        if client.is_connected(): await client.disconnect()
+        if session_name in loaded_clients: del loaded_clients[session_name]
+        return await cancel_return_to_menu(update, context)
+
+async def add_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    code = update.message.text.strip()
+    client = context.user_data['client']
+    session_name = context.user_data['session_name']
+    
+    try:
+        await client.sign_in(context.user_data['phone'], code)
+        await update.message.reply_text("✅ **Шаг 3/4:** Аккаунт авторизован. Введите **локальный пароль доступа** для этого аккаунта:")
+        return SET_PASSWORD
+    except SessionPasswordNeededError:
+        await update.message.reply_text("🔒 **Шаг 3/4:** Требуется пароль 2FA. Введите пароль Telegram 2FA:")
+        return ADD_2FA
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка при входе по коду: `{e}`")
+        if client.is_connected(): await client.disconnect()
+        if session_name in loaded_clients: del loaded_clients[session_name]
+        return await cancel_return_to_menu(update, context)
+
+async def add_2fa(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pwd = update.message.text.strip()
+    client = context.user_data['client']
+    session_name = context.user_data['session_name']
+    
+    try:
+        await client.sign_in(password=pwd)
+        await update.message.reply_text("✅ **Шаг 4/4:** Аккаунт авторизован. Введите **локальный пароль доступа** для этого аккаунта:")
+        return SET_PASSWORD
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка при входе по 2FA: `{e}`")
+        if client.is_connected(): await client.disconnect()
+        if session_name in loaded_clients: del loaded_clients[session_name]
+        return await cancel_return_to_menu(update, context)
+
+async def set_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sets the local access password and finalizes account addition/linkage."""
+    password = update.message.text.strip()
+    chat_id = str(update.effective_chat.id)
+    session_name = context.user_data['session_name']
+    client = context.user_data['client']
+    
+    try:
+        is_change_pwd = context.user_data.get('is_change_pwd', False)
+        
+        # Привязываем к чату (это нужно для функции list_my_accounts, но теперь используется list_all_accounts_for_all)
+        # Оставляем привязку, чтобы знать, кто добавил сессию
+        clients.setdefault(chat_id, {})[session_name] = client 
+        
+        if not is_change_pwd and session_name not in state:
+             state.setdefault(session_name, {"auto_reply": False, "trigger": "", "reply": "", "auto_read": False})
+             me_obj = await client.get_me()
+             meta[session_name] = {
+                "started": datetime.datetime.now(),
+                "login_time": datetime.datetime.now(), 
+                "me": me_obj
+             }
+             client.add_event_handler(make_handlers_for(client), events.NewMessage)
+        
+        # Сохраняем ЧИСТЫЙ пароль
+        passwords[session_name] = password 
+        save_state()
+        
+        if is_change_pwd:
+             text = f"🎉 **Успех!** Локальный пароль для аккаунта `{session_name}` **успешно изменен** на: `{password}`"
+        else:
+             text = f"🎉 **Успех!** Аккаунт `{session_name}` теперь привязан и защищен локальным паролем: `{password}`\n\nИспользуйте меню для управления."
+
+        await update.message.reply_text(text)
+        return await cancel_return_to_menu(update, context)
+        
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка во время финальной настройки/смены пароля: `{e}`")
+        if not is_change_pwd:
+            if client.is_connected(): await client.disconnect()
+            if session_name in loaded_clients: del loaded_clients[session_name]
+        return await cancel_return_to_menu(update, context)
+
+# --------------------------
+# Password Management Conversation
+# --------------------------
+
+async def pass_select_change(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the selection of the account to change the password for (via CallbackQuery)."""
+    query = update.callback_query
+    await query.answer()
+    
+    data_parts = query.data.split('_', 1)
+    if len(data_parts) != 2:
+        await query.edit_message_text("❌ Ошибка при выборе аккаунта.")
+        return await cancel_return_to_menu(update, context)
+
+    session_name = data_parts[1]
+    
+    context.user_data['session_name'] = session_name
+    context.user_data['client'] = get_client(str(query.message.chat_id), session_name) 
+    context.user_data['is_change_pwd'] = True 
+    
+    await query.edit_message_text(f"✨ Введите **новый пароль доступа** для `{session_name}`:")
+    return SET_PASSWORD 
+
+# --------------------------
+# Select Account and Actions Conversation
+# --------------------------
+
+async def account_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the account selection, checks timeout/admin status, and prompts for password if needed."""
+    query = update.callback_query
+    await query.answer()
+    
+    chat_id = str(query.message.chat_id)
+    is_admin = chat_id == str(ADMIN_ID)
+    
+    data_parts = query.data.split('_', 1)
+    if len(data_parts) != 2:
+        await query.edit_message_text("❌ Ошибка при выборе аккаунта.")
+        return await cancel_return_to_menu(update, context)
+
+    session_name = data_parts[1]
+    context.user_data['session_name'] = session_name
+    
+    client = get_client(chat_id, session_name)
+    
+    if not client:
+        await query.edit_message_text("❌ Аккаунт не загружен в память бота. Попробуйте перезапустить бота.")
+        return await cancel_return_to_menu(update, context)
+
+    context.user_data['client'] = client
+    
+    # 1. Администратор: доступ без пароля
+    if is_admin:
+        grant_access(chat_id, session_name) # На всякий случай обновляем доступ
+        status_text = f"👑 **[ADMIN MODE]** Доступ подтвержден для `{session_name}`."
+        keyboard = get_action_keyboard()
+        await query.edit_message_text(
+            f"{status_text}\nВыберите действие:", 
+            reply_markup=keyboard,
+            parse_mode='Markdown'
+        )
+        return ACTION_SELECT
+
+    # 2. Обычный пользователь: проверка доступа по времени
+    if check_access_validity(chat_id, session_name):
+        expires_at = access_grants[chat_id][session_name]
+        remaining = expires_at - datetime.datetime.now()
+        status_text = (f"🔓 **Доступ подтвержден для** `{session_name}`.\n"
+                     f"Осталось времени: **{int(remaining.total_seconds() // 60)} минут**.")
+        
+        keyboard = get_action_keyboard()
+        await query.edit_message_text(
+            f"{status_text}\nВыберите действие:", 
+            reply_markup=keyboard,
+            parse_mode='Markdown'
+        )
+        return ACTION_SELECT
+        
+    # 3. Обычный пользователь: требуется пароль
+    if session_name not in passwords:
+         # Аккаунт не имеет локального пароля - доступ для обычных пользователей невозможен.
+         await query.edit_message_text(f"⚠️ Аккаунт `{session_name}` не защищен локальным паролем. Доступ только для Администратора.")
+         return await cancel_return_to_menu(update, context)
+
+    # Запрашиваем локальный пароль
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад в меню", callback_data="menu_main")]])
+    await query.edit_message_text(f"🔑 Доступ истек. Введите **локальный пароль доступа** для аккаунта `{session_name}`:", reply_markup=keyboard)
+    return CONFIRM_PASSWORD
+
+async def confirm_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Authenticates the user, grants access, and shows action menu."""
+    password = update.message.text.strip()
+    session_name = context.user_data['session_name']
+    chat_id = str(update.effective_chat.id)
+    
+    expected_pwd = passwords.get(session_name)
+    
+    if expected_pwd != password:
+        await update.message.reply_text("❌ **Неверный пароль.** Операция отменена. Возврат в главное меню.")
+        return await cancel_return_to_menu(update, context, clear_user_data=True)
+
+    client = context.user_data['client']
+    
+    if not client.is_connected():
+        try:
+            await client.connect()
+            if not await client.is_user_authorized():
+                 await update.message.reply_text("❌ Клиент не авторизован. Пожалуйста, переподключите аккаунт.")
+                 return await cancel_return_to_menu(update, context, clear_user_data=True)
+        except Exception as e:
+            await update.message.reply_text(f"❌ Не удалось переподключить клиент: `{e}`.")
+            return await cancel_return_to_menu(update, context, clear_user_data=True)
+
+    grant_access(chat_id, session_name)
+    
+    keyboard = get_action_keyboard()
+    await update.message.reply_text(
+        f"✅ **Пароль подтвержден для** `{session_name}`. Доступ выдан на 30 минут.\n"
+        f"Выберите действие:", 
+        reply_markup=keyboard
+    )
+    return ACTION_SELECT
+
+def get_action_keyboard() -> InlineKeyboardMarkup:
+    """Generates the main action keyboard for a selected account, including new security functions."""
+    actions = [
+        ("✉️ Отправить сообщение", "action_send_msg"), 
+        ("📝 Показать 50 чатов", "action_show_chats"),
+        ("👁️ Прочитать последние", "action_read_last"),
+        ("👤 Список контактов", "action_show_contacts"),
+        ("👥 Список групп/каналов", "action_show_groups"),
+        
+        ("🔑 Изменить лок. пароль", "action_change_local_pwd"),
+        ("🔑 Показать лок. пароль", "action_show_local_pwd"),
+        ("🔒 Статус и Подсказка 2FA", "action_show_2fa_status"), 
+        ("🔒 Изменить 2FA (Telegram)", "action_change_2fa"),
+        
+        ("🤖 Вкл. Авто-ответ", "action_auto_reply_on"),
+        ("🤖 Выкл. Авто-ответ", "action_auto_reply_off"),
+        ("👀 Вкл. Авто-прочтение", "action_auto_read_on"),
+        ("👀 Выкл. Авто-прочтение", "action_auto_read_off"),
+        
+        ("🗑️ Очистить историю", "action_clear_history"),
+        ("⛔ Удалить сообщение", "action_delete_message"),
+        ("📢 Массовая рассылка", "action_mass_broadcast"),
+        ("⏰ Отложенное сообщение", "action_scheduled_message"),
+        ("👍 Отправить реакцию", "action_send_reaction"),
+        
+        ("📸 Сменить фото", "action_change_photo"),
+        ("✏️ Сменить имя", "action_change_name"),
+        ("ℹ️ Инфо об аккаунте", "action_session_info"),
+        ("📊 Статистика (сегодня)", "action_account_stats"),
+        
+        ("🚪 Выход (текущее устр.)", "action_logout_current"),
+        ("💥 Выход (все устр.)", "action_logout_all"),
+        ("🔥 Удалить сессию (файл)", "action_delete_session"),
+        ("🛑 Отключить клиент (Admin)", "action_disconnect_client")
+    ]
+
+    keyboard = []
+    row_size = 2 if len(actions) % 3 != 0 or len(actions) <= 12 else 3 
+    
+    for i in range(0, len(actions), row_size):
+        row = []
+        for j in range(row_size):
+            if i + j < len(actions):
+                row.append(InlineKeyboardButton(actions[i+j][0], callback_data=actions[i+j][1]))
+        if row:
+            keyboard.append(row)
+        
+    keyboard.append([InlineKeyboardButton("⬅️ Назад в Главное меню", callback_data="menu_main")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+async def handle_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Maps the selected callback query to an action function and prompts for input."""
+    query = update.callback_query
+    data = query.data
+    await query.answer()
+    
+    client = context.user_data['client']
+    chat_id = str(query.message.chat_id)
+    session_name = context.user_data['session_name']
+
+    if not check_access_validity(chat_id, session_name):
+        await query.edit_message_text(
+            f"❌ **Доступ истек!** Для продолжения работы с `{session_name}` требуется повторный ввод пароля."
+        )
+        return SELECT_ACCOUNT 
+    
+    actions_map = {
+        "action_send_msg": (send_message, ["Введите username или ID получателя:", "Введите текст сообщения:"]),
+        "action_show_chats": (show_chats, []),
+        "action_read_last": (read_last_messages, ["Введите ID или username чата:", "Сколько сообщений показать (по умолчанию 10):"]),
+        "action_show_contacts": (show_contacts, []),
+        "action_show_groups": (show_groups, []),
+        
+        "action_change_local_pwd": (change_local_password_start, ["Введите **новый** локальный пароль доступа:"]), 
+        "action_show_local_pwd": (show_local_password, []),                                                        
+        "action_show_2fa_status": (show_2fa_status, []), 
+        "action_change_2fa": (change_2fa_start_conv, []),                                                               
+        
+        "action_auto_reply_on": (auto_reply_enable, ["Введите текст-триггер:", "Введите текст авто-ответа:"]),
+        "action_auto_reply_off": (auto_reply_disable, []),
+        "action_auto_read_on": (auto_read_enable, []),
+        "action_auto_read_off": (auto_read_disable, []),
+        "action_change_photo": (change_profile_photo, ["Введите путь к новому фото (доступный боту):"]),
+        "action_change_name": (change_name, ["Введите имя:", "Введите фамилию (опционально):"]),
+        "action_session_info": (session_info, []),
+        "action_account_stats": (account_stats, []),
+        "action_clear_history": (clear_history, ["Введите ID или username чата:"]),
+        "action_delete_message": (delete_message, ["Введите ID или username чата:", "Введите ID сообщения:"]),
+        "action_mass_broadcast": (mass_broadcast, ["Введите текст рассылки:"]),
+        "action_scheduled_message": (scheduled_message, ["Введите username/ID получателя:", "Введите текст сообщения:", "Введите задержку в секундах:"]),
+        "action_send_reaction": (send_reaction, ["Введите ID или username чата:", "Введите ID сообщения:", "Введите эмодзи реакции (напр. 👍):"]),
+        
+        "action_logout_current": (logout_current, ["**Подтвердите** выход из текущей сессии (y/n):"]),
+        "action_logout_all": (logout_all_devices, ["**Подтвердите** выход из ВСЕХ сессий (y/n):"]),
+        "action_delete_session": (delete_session, ["**Подтвердите** удаление файла сессии и отключение (y/n):"]),
+        "action_disconnect_client": (disconnect_client, ["**Подтвердите** отключение клиента от сети (y/n):"]),
+    }
+    
+    if data not in actions_map:
+        await query.edit_message_text("❌ Неверный выбор. Пожалуйста, выберите действие из списка.")
+        return ACTION_SELECT
+        
+    action_func, inputs = actions_map[data]
+    context.user_data['action'] = action_func
+    context.user_data['inputs'] = inputs
+    context.user_data['current_input'] = 0
+    context.user_data['input_values'] = [] 
+    
+    if data == "action_change_2fa":
+         return await change_2fa_start_conv(update, context)
+
+    try:
+        await query.edit_message_text(f"Выбрано: **{action_func.__name__.replace('_', ' ').title()}**.")
+    except: pass
+    
+    if not inputs:
+        try:
+            result = await action_func(client, update, context)
+            await query.message.reply_text(result or "✅ **Действие выполнено успешно.**")
+        except Exception as e:
+            await query.message.reply_text(f"❌ **Ошибка:** `{type(e).__name__}: {e}`")
+        
+        keyboard = get_action_keyboard()
+        await query.message.reply_text("↩️ **Выберите следующее действие:**", reply_markup=keyboard)
+        return ACTION_SELECT 
+        
+    await query.message.reply_text(f"📝 **Ввод 1/{len(inputs)}:** {inputs[0]}")
+    return INPUT
+
+async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Collects inputs for actions and executes the function when all are collected."""
+    context.user_data['input_values'].append(update.message.text.strip())
+    context.user_data['current_input'] += 1
+    
+    current_input_index = context.user_data['current_input']
+    total_inputs = len(context.user_data['inputs'])
+    
+    if current_input_index < total_inputs:
+        next_input_prompt = context.user_data['inputs'][current_input_index]
+        await update.message.reply_text(f"📝 **Ввод {current_input_index + 1}/{total_inputs}:** {next_input_prompt}")
+        return INPUT
+    
+    try:
+        result = await context.user_data['action'](context.user_data['client'], update, context)
+        await update.message.reply_text(result or "✅ **Действие выполнено успешно.**")
+    except Exception as e:
+        await update.message.reply_text(f"❌ **Ошибка:** `{type(e).__name__}: {e}`")
+        
+    for key in ['action', 'inputs', 'input_values', 'current_input']:
+        context.user_data.pop(key, None)
+        
+    keyboard = get_action_keyboard()
+    await update.message.reply_text("↩️ **Выберите следующее действие:**", reply_markup=keyboard)
+    return ACTION_SELECT
+
+async def cancel_return_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, clear_user_data: bool = False):
+    """Generic fallback/cancel command that returns to main menu."""
+    if clear_user_data:
+        for key in ['phone', 'client', 'session_name', 'action', 'inputs', 'input_values', 'is_change_pwd', 'auth_password', 'new_password', 'password_hint', 'auth_2fa_data']:
+            context.user_data.pop(key, None)
+
+    await asyncio.sleep(0.5) 
+    
+    if update.callback_query:
+        try:
+            await main_menu(update, context, "↩️ **Операция отменена/завершена. Возврат в Главное меню.**")
+        except Exception:
+            if update.callback_query.message:
+                 await update.callback_query.message.reply_text("↩️ **Операция отменена/завершена. Возврат в Главное меню.**", reply_markup=get_main_menu_keyboard(str(update.effective_chat.id)))
+    elif update.message:
+        await main_menu(update, context, "↩️ **Операция отменена/завершена. Возврат в Главное меню.**")
+        
+    return ConversationHandler.END
+
+
+# --------------------------
+# Action Implementations
+# --------------------------
+def human_delta(dt: datetime.datetime) -> str:
+    """Calculates and formats time difference in a human-readable way."""
+    if dt is None: return "unknown"
+    delta = datetime.datetime.now() - dt
+    secs = int(delta.total_seconds())
+    if secs < 60: return f"{secs}s"
+    mins = secs // 60
+    if mins < 60: return f"{mins}m{secs%60}s"
+    hrs = mins // 60
+    if hrs < 24: return f"{hrs}h{mins%60}m"
+    days = hrs // 24
+    return f"{days}d{hrs%24}h"
+
+async def send_message(client, update, context):
+    target, text = context.user_data['input_values']
+    await client.send_message(await resolve_entity(client, target), text) 
+    return "✅ Сообщение отправлено! (Длинные сообщения будут разбиты и отправлены автоматически)"
+
+async def show_chats(client, update, context):
+    result = []
+    async for d in client.iter_dialogs(limit=50):
+        kind = "User" if d.is_user else ("Channel" if d.is_channel else "Group")
+        uname = getattr(d.entity, "username", "N/A")
+        result.append(f"- **{d.name}** | Type={kind} | ID={d.id} | Username=**@{uname}** | Unread={d.unread_count}")
+    return "📝 **Диалоги (Первые 50):**\n" + "\n".join(result) or "Диалоги не найдены"
+
+async def read_last_messages(client, update, context):
+    chat, lim = context.user_data['input_values']
+    ent = await resolve_entity(client, chat)
+    limit = int(lim) if lim and lim.isdigit() else 10
+    msgs = await client.get_messages(ent, limit=limit)
+    result = []
+    for m in msgs:
+        text = (m.message or "<Медиа/Служебное сообщение>").replace("\n", " ").strip()[:50]
+        sender_id = m.sender_id
+        is_out = "OUT" if m.out else "IN"
+        result.append(f"[{m.id}] **{is_out}** from={sender_id} | {text}")
+    return f"📜 **Последние {limit} сообщений в {chat}:**\n" + "\n".join(result) or "Сообщения не найдены"
+
+async def show_contacts(client, update, context):
+    result = await client(functions.contacts.GetContactsRequest(hash=0))
+    contacts = result.users
+    result_list = []
+    for c in contacts:
+        uname = getattr(c,'username','N/A')
+        result_list.append(f"- **{c.first_name or ''} {c.last_name or ''}** | ID={c.id} | Username=**@{uname}**")
+        
+    return "👥 **Контакты:**\n" + "\n".join(result_list) or "Контакты не найдены"
+
+async def show_groups(client, update, context):
+    result = []
+    async for d in client.iter_dialogs(limit=200):
+        if d.is_group or d.is_channel:
+            ent = d.entity
+            kind = "Channel" if d.is_channel else "Group"
+            uname = getattr(ent,'username','N/A')
+            result.append(f"- **{d.name}** | Type={kind} | ID={d.id} | Username=**@{uname}**")
+    return "🏛️ **Группы и Каналы:**\n" + "\n".join(result) or "Группы или каналы не найдены"
+
+async def auto_reply_enable(client, update, context):
+    name = session_name_from_client(client)
+    trigger, reply = context.user_data['input_values']
+    state.setdefault(name, {})["auto_reply"] = True
+    state[name]["trigger"] = trigger
+    state[name]["reply"] = reply
+    save_state()
+    return f"🤖 Авто-ответ **ВКЛЮЧЕН** для `{name}`.\nТриггер: `{trigger}`\nОтвет: `{reply}`"
+
+async def auto_reply_disable(client, update, context):
+    name = session_name_from_client(client)
+    state.setdefault(name, {})["auto_reply"] = False
+    save_state()
+    return f"🤖 Авто-ответ **ОТКЛЮЧЕН** для `{name}`."
+
+async def auto_read_enable(client, update, context):
+    name = session_name_from_client(client)
+    state.setdefault(name, {})["auto_read"] = True
+    save_state()
+    return f"👀 Авто-прочтение **ВКЛЮЧЕНО** для `{name}`."
+
+async def auto_read_disable(client, update, context):
+    name = session_name_from_client(client)
+    state.setdefault(name, {})["auto_read"] = False
+    save_state()
+    return f"👀 Авто-прочтение **ОТКЛЮЧЕНО** для `{name}`."
+
+async def change_local_password_start(client, update, context):
+    """Handles the actual change of the local password (saving clean password)."""
+    new_password = context.user_data['input_values'][0]
+    session_name = context.user_data['session_name']
+    
+    passwords[session_name] = new_password
+    save_state()
+    
+    return f"🔑 Локальный пароль доступа для `{session_name}` **успешно изменен** на: `{new_password}`."
+
+async def show_local_password(client, update, context):
+    """Shows the clean local password."""
+    session_name = context.user_data['session_name']
+    clean_pwd = passwords.get(session_name, "N/A (Пароль не установлен)")
+    
+    return (f"🔑 **Текущий локальный пароль доступа** для `{session_name}`:\n"
+            f"Пароль: `{clean_pwd}`\n\n"
+            f"⚠️ **Внимание:** Пароль хранится в виде чистого текста в `passwords.json`.")
+
+
+async def show_2fa_status(client, update, context): 
+    """Retrieves and displays Telegram 2FA (Cloud Password) status."""
+    auth_pw = await client(functions.account.GetPasswordRequest())
+    
+    if auth_pw.has_recovery and auth_pw.email_unconfirmed_pattern is None:
+        email_status = "✅ Есть (Подтвержден)"
+    elif auth_pw.has_recovery and auth_pw.email_unconfirmed_pattern:
+        email_status = f"⚠️ Есть, но не подтвержден (Начало: `{auth_pw.email_unconfirmed_pattern}`)"
+    else:
+        email_status = "❌ Нет"
+
+    status = "✅ Установлен" if auth_pw.has_password else "❌ Не установлен"
+    hint = f"`{auth_pw.hint}`" if auth_pw.hint else "Нет"
+    
+    return (f"🔒 **Статус Telegram 2FA (Облачный Пароль)**\n"
+            f"⚠️ **ВНИМАНИЕ:** Технически невозможно извлечь облачный пароль Telegram в чистом виде.\n\n"
+            f"Статус пароля: **{status}**\n"
+            f"Подсказка: {hint}\n"
+            f"Почта для восстановления: {email_status}")
+
+
+# --- 2FA Change Conversation Functions ---
+
+async def change_2fa_start_conv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Starts the 2FA change/set process."""
+    client = context.user_data['client']
+    auth_pw = await client(functions.account.GetPasswordRequest())
+    context.user_data['auth_2fa_data'] = auth_pw
+    
+    if update.callback_query:
+        msg_editor = update.callback_query.edit_message_text
+    elif update.message:
+        msg_editor = update.message.reply_text
+    else:
+        return ACTION_SELECT # Fallback
+
+    if auth_pw.has_password:
+        await msg_editor("🔑 **Шаг 1/4:** Введите **текущий** пароль 2FA Telegram:")
+        return INPUT_OLD_2FA
+    else:
+        await msg_editor("✨ **Шаг 1/4:** Пароль 2FA не установлен. Введите **новый** пароль 2FA, который вы хотите установить:")
+        return INPUT_NEW_2FA
+
+async def input_old_2fa(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Receives and checks the current 2FA password."""
+    old_password = update.message.text.strip()
+    client = context.user_data['client']
+    
+    try:
+        # Проверяем пароль
+        await client(functions.auth.CheckPasswordRequest(password=old_password))
+        context.user_data['auth_password'] = old_password
+        
+        await update.message.reply_text("✅ **Пароль подтвержден.**\n\n✨ **Шаг 2/4:** Введите **новый** пароль 2FA (или тот же, если хотите изменить только почту/подсказку):")
+        return INPUT_NEW_2FA
+        
+    except Exception as e:
+        await update.message.reply_text(f"❌ **Ошибка:** Неверный текущий пароль 2FA: `{e}`. Операция отменена.")
+        return await cancel_return_to_menu(update, context, clear_user_data=True)
+
+async def input_new_2fa(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Receives the new 2FA password."""
+    new_password = update.message.text.strip()
+    context.user_data['new_password'] = new_password
+    
+    await update.message.reply_text("📝 **Шаг 3/4:** Введите **подсказку** для нового пароля (или '-' для пропуска):")
+    return INPUT_HINT_2FA
+
+async def input_hint_2fa(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Receives the password hint."""
+    hint = update.message.text.strip()
+    context.user_data['password_hint'] = hint if hint != '-' else None
+
+    await update.message.reply_text("📧 **Шаг 4/4:** Введите **почту для восстановления** (или '-' для пропуска):")
+    return INPUT_EMAIL_2FA
+
+async def input_email_2fa(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Receives the recovery email and finalizes the change/set operation."""
+    recovery_email = update.message.text.strip()
+    client = context.user_data['client']
+    auth_pw = context.user_data.get('auth_2fa_data')
+    
+    result_text = None
+    
+    try:
+        old_password = context.user_data.get('auth_password')
+        new_password = context.user_data['new_password']
+        hint = context.user_data['password_hint']
+        email = recovery_email if recovery_email != '-' else None
+        
+        # Если почта не установлена или нет подтверждения
+        if email and (not auth_pw or not auth_pw.has_recovery):
+            # Установка или изменение пароля + отправка кода
+            if old_password:
+                await client(functions.account.UpdatePasswordSettingsRequest(
+                    current_password=old_password,
+                    new_password=new_password,
+                    hint=hint,
+                    email=email
+                ))
+            else:
+                 await client(functions.account.SetPasswordRequest(
+                    new_password=new_password,
+                    hint=hint,
+                    email=email,
+                    no_spaces=True
+                ))
+
+            await update.message.reply_text("📧 ✅ **Пароль изменен/установлен.** На ваш email отправлен код подтверждения. Введите этот код для подтверждения почты:")
+            return INPUT_EMAIL_2FA # Снова ждем ввод почты, но теперь как код
+        
+        elif email and 'EMAIL_UNCONFIRMED' in str(auth_pw.email_unconfirmed_pattern) and recovery_email != '-':
+             # Пользователь вводит код подтверждения
+             email_code = recovery_email
+             await client(functions.account.ConfirmPasswordEmailRequest(code=email_code))
+             result_text = "🎉 **Успех!** Почта для восстановления 2FA **успешно подтверждена**."
+        
+        else:
+             # Изменение пароля/подсказки без изменения/установки почты
+             if old_password:
+                await client(functions.account.UpdatePasswordSettingsRequest(
+                    current_password=old_password,
+                    new_password=new_password,
+                    hint=hint,
+                    email=email
+                ))
+             else:
+                  await client(functions.account.SetPasswordRequest(
+                    new_password=new_password,
+                    hint=hint,
+                    email=email,
+                    no_spaces=True
+                ))
+             result_text = "🎉 **Успех!** Пароль 2FA Telegram **успешно изменен/установлен** (без подтверждения почты)."
+            
+    except FloodWaitError as fw:
+        await update.message.reply_text(f"❌ **Ошибка:** Превышен лимит запросов. Попробуйте через {fw.seconds} сек.")
+        return await cancel_return_to_menu(update, context, clear_user_data=True)
+    except Exception as e:
+        await update.message.reply_text(f"❌ **Ошибка 2FA:** `{type(e).__name__}: {e}`. Операция отменена.")
+        return await cancel_return_to_menu(update, context, clear_user_data=True)
+            
+    await update.message.reply_text(result_text)
+    return await cancel_return_to_menu(update, context, clear_user_data=True)
+
+# --- End 2FA Change Conversation Functions ---
+
+async def change_profile_photo(client, update, context):
+    path = context.user_data['input_values'][0]
+    if not os.path.exists(path):
+        return f"❌ Ошибка: Файл не найден по пути: `{path}`"
+    
+    file = await client.upload_file(path)
+    await client(functions.photos.UploadProfilePhotoRequest(file=file))
+    return "✅ Фото профиля изменено."
+
+async def change_name(client, update, context):
+    first, last = context.user_data['input_values']
+    await client(functions.account.UpdateProfileRequest(first_name=first or None, last_name=(last or None)))
+    return f"✅ Имя изменено на: **{first or ''} {last or ''}**"
+
+async def session_info(client, update, context):
+    name = session_name_from_client(client)
+    started = meta.get(name, {}).get("started")
+    login_time = meta.get(name, {}).get("login_time")
+    
+    me = await client.get_me() 
+    meta[name]["me"] = me 
+    
+    return (f"ℹ️ **Информация об аккаунте** `{name}`\n"
+            f"ID: `{me.id}`\n"
+            f"Username: `@{getattr(me,'username','N/A')}`\n"
+            f"Имя: **{getattr(me,'first_name','')} {getattr(me,'last_name','')}**\n"
+            f"Бот запущен: {started.strftime('%Y-%m-%d %H:%M:%S') if started else 'N/A'} (Uptime: **{human_delta(started)}**)\n"
+            f"Время входа: {login_time.strftime('%Y-%m-%d %H:%M:%S') if login_time else 'N/A'} (Со времени входа: **{human_delta(login_time)}**)")
+
+async def clear_history(client, update, context):
+    chat = context.user_data['input_values'][0]
+    ent = await resolve_entity(client, chat)
+    await client(functions.messages.DeleteHistoryRequest(peer=ent, max_id=0, revoke=True, just_clear=False))
+    return f"⚠️ **Вся история очищена для** `{chat}`. (Это навсегда)"
+
+async def delete_message(client, update, context):
+    chat, mid = context.user_data['input_values']
+    try:
+        mid_int = int(mid)
+    except ValueError:
+        return "❌ ID сообщения должно быть целым числом."
+        
+    await client.delete_messages(await resolve_entity(client, chat), [mid_int], revoke=True)
+    return f"✅ Сообщение ID `{mid}` удалено в `{chat}`."
+
+async def mass_broadcast(client, update, context):
+    text = context.user_data['input_values'][0]
+    sent_count = 0
+    errors = 0
+    result = ["📢 **Начало рассылки...**"]
+    
+    async for d in client.iter_dialogs(limit=500):
+        if d.is_user and not d.entity.bot and not d.is_channel:
+            try:
+                await client.send_message(d.id, text)
+                sent_count += 1
+                await asyncio.sleep(0.5) 
+            except FloodWaitError as fw:
+                await asyncio.sleep(fw.seconds)
+            except Exception:
+                errors += 1
+                
+    result.append(f"**[ГОТОВО] Рассылка завершена.**")
+    result.append(f"Отправлено успешно: **{sent_count} чатам**.")
+    result.append(f"Не удалось отправить: **{errors} чатам**.")
+    return "\n".join(result)
+
+async def account_stats(client, update, context):
+    today = datetime.date.today()
+    sent_today = 0
+    recv_today = 0
+    
+    async for d in client.iter_dialogs(limit=20):
+        msgs = await client.get_messages(d.id, limit=50) 
+        for m in msgs:
+            if getattr(m, "date", None) and m.date.date() == today:
+                if getattr(m, "out", False): sent_today += 1
+                else: recv_today += 1
+                
+    return (f"📊 **Статистика аккаунта (Сегодня)**\n"
+            f"Отправлено сообщений: **{sent_today}**\n"
+            f"Получено сообщений: **{recv_today}**")
+
+async def scheduled_message(client, update, context):
+    user, text, delay_str = context.user_data['input_values']
+    
+    try:
+        delay = int(delay_str)
+        if delay < 1:
+            return "❌ Задержка должна быть положительной."
+    except ValueError:
+        return "❌ Задержка должна быть целым числом в секундах."
+
+    await update.message.reply_text(f"⏳ Сообщение запланировано для `{user}` через **{delay} секунд**.")
+    
+    async def sender_task():
+        await asyncio.sleep(delay)
+        try:
+            await client.send_message(await resolve_entity(client, user), text)
+            await update.message.reply_text(f"✅ Отложенное сообщение отправлено для `{user}`.")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Ошибка при отправке отложенного сообщения для `{user}`: `{type(e).__name__}: {e}`")
+
+    asyncio.create_task(sender_task())
+    return "✅ Задача по отправке отложенного сообщения создана."
+
+async def send_reaction(client, update, context):
+    chat, mid_str, emoji = context.user_data['input_values']
+    
+    try:
+        mid = int(mid_str)
+        peer = await resolve_entity(client, chat)
+    except ValueError:
+        return "❌ ID сообщения должно быть целым числом."
+
+    if len(emoji) > 5:
+        return "❌ Кажется, это не эмодзи. Попробуйте один символ."
+
+    await client(functions.messages.SendReactionRequest(
+        peer=await client.get_input_entity(peer),
+        msg_id=mid,
+        reaction=types.ReactionEmoji(emoticon=emoji)
+    ))
+    return f"✅ Реакция **{emoji}** отправлена на сообщение ID `{mid}` в `{chat}`."
+
+async def logout_current(client, update, context):
+    name = session_name_from_client(client)
+    confirm = context.user_data['input_values'][0].lower()
+    if confirm == "y":
+        try:
+            await client.log_out()
+            for chat_id, clients_dict in clients.items():
+                if name in clients_dict: del clients_dict[name]
+            return f"👋 **Выход выполнен** из текущей сессии для `{name}`."
+        except Exception as e:
+            return f"❌ Ошибка во время выхода: `{e}`"
+    return "🚫 Выход отменен."
+
+async def logout_all_devices(client, update, context):
+    name = session_name_from_client(client)
+    confirm = context.user_data['input_values'][0].lower()
+    if confirm == "y":
+        try:
+            await client(functions.auth.ResetAuthorizationsRequest())
+            await client.disconnect() 
+            for chat_id, clients_dict in clients.items():
+                if name in clients_dict: del clients_dict[name]
+            return f"⚠️ **Выход выполнен со ВСЕХ устройств** для `{name}`. Требуется повторная авторизация."
+        except Exception as e:
+            return f"❌ Ошибка во время массового выхода: `{e}`"
+    return "🚫 Выход отменен."
+    
+async def disconnect_client(client, update, context):
+    name = session_name_from_client(client)
+    confirm = context.user_data['input_values'][0].lower()
+    if confirm != "y":
+        return "🚫 Отключение клиента от сети отменено."
+        
+    try:
+        if client.is_connected():
+            await client.disconnect()
+            return f"🛑 **Клиент** `{name}` **отключен от сети** (файл сессии сохранен)."
+        else:
+            return f"✅ Клиент `{name}` уже был отключен."
+    except Exception as e:
+        return f"❌ Ошибка при отключении клиента: `{e}`"
+
+async def delete_session(client, update, context):
+    name = session_name_from_client(client)
+    confirm = context.user_data['input_values'][0].lower()
+    if confirm != "y":
+        return "🚫 Удаление сессии отменено."
+        
+    session_path = client.session.filename
+    
+    try: await client.log_out()
+    except Exception: pass
+        
+    for chat_id_key, clients_dict in clients.items():
+        if name in clients_dict: del clients_dict[name]
+    if name in loaded_clients: del loaded_clients[name]
+
+    if os.path.exists(session_path): os.remove(session_path)
+        
+    if name in state: del state[name]
+    if name in meta: del meta[name]
+    if name in passwords: del passwords[name]
+
+    save_state()
+    
+    return f"🗑️ **Сессия** `{name}` **удалена** (файл удален, пароль отвязан). Клиент отключен."
+
+# --------------------------
+# Load All Accounts
+# --------------------------
+async def load_all_accounts():
+    """Loads all session files and checks authorization status."""
+    load_state()
+    session_files = [f for f in os.listdir(SESSION_DIR) if f.endswith(".session")]
+    awaitables = []
+    
+    for fname in session_files:
+        async def process_session(fname):
+            session_path = os.path.join(SESSION_DIR, fname)
+            session_name = fname.replace(".session", "")
+            
+            if session_name in loaded_clients: return
+            client = TelegramClient(session_path, DEFAULT_API_ID, DEFAULT_API_HASH)
+            try:
+                await client.start()
+                if not await client.is_user_authorized():
+                    await client.disconnect()
+                    return
+                
+                me_obj = await client.get_me()
+                meta[session_name] = {
+                    "started": datetime.datetime.now(), 
+                    "login_time": datetime.datetime.now(), 
+                    "me": me_obj
+                }
+                client.add_event_handler(make_handlers_for(client), events.NewMessage)
+                loaded_clients[session_name] = client
+            except Exception:
+                try:
+                    if client.is_connected(): await client.disconnect()
+                except: pass
+        
+        awaitables.append(process_session(fname))
+
+    if awaitables:
+        await asyncio.gather(*awaitables)
+
+
+# --------------------------
+# Main and Handlers Registration
+# --------------------------
+
+async def main():
+    """Initializes and runs the bot."""
+    
+    # 1. Загрузка аккаунтов (работает в фоне)
+    await load_all_accounts()
+    
+    # 2. Инициализация и запуск Telegram Bot API
+    app = Application.builder().token(BOT_TOKEN).build()
+    
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(handle_menu_callbacks, pattern=r'^menu_main|menu_list_acc$'))
+
+    add_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(handle_menu_callbacks, pattern=r'^menu_add_acc$')],
+        states={
+            ADD_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_phone)],
+            ADD_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_code)],
+            ADD_2FA: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_2fa)],
+            SET_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_password)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_return_to_menu), CallbackQueryHandler(cancel_return_to_menu, pattern=r'^menu_main$')],
+        allow_reentry=True
+    )
+    
+    action_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(handle_menu_callbacks, pattern=r'^menu_select_acc$')],
+        states={
+            SELECT_ACCOUNT: [CallbackQueryHandler(account_selected, pattern=r'^act_')],
+            CONFIRM_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, confirm_password)],
+            ACTION_SELECT: [CallbackQueryHandler(handle_action, pattern=r'^action_')],
+            INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_input)],
+            INPUT_OLD_2FA: [MessageHandler(filters.TEXT & ~filters.COMMAND, input_old_2fa)],
+            INPUT_NEW_2FA: [MessageHandler(filters.TEXT & ~filters.COMMAND, input_new_2fa)],
+            INPUT_HINT_2FA: [MessageHandler(filters.TEXT & ~filters.COMMAND, input_hint_2fa)],
+            INPUT_EMAIL_2FA: [MessageHandler(filters.TEXT & ~filters.COMMAND, input_email_2fa)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_return_to_menu), CallbackQueryHandler(cancel_return_to_menu, pattern=r'^menu_main$')],
+        allow_reentry=True
+    )
+    
+    change_pass_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(handle_menu_callbacks, pattern=r'^menu_change_pwd$')],
+        states={
+            PASS_SELECT_CHANGE: [CallbackQueryHandler(pass_select_change, pattern=r'^chg_')],
+            SET_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_password)] 
+        },
+        fallbacks=[CommandHandler("cancel", cancel_return_to_menu), CallbackQueryHandler(cancel_return_to_menu, pattern=r'^menu_main$')],
+        allow_reentry=True
+    )
+    
+    app.add_handler(add_conv)
+    app.add_handler(action_conv)
+    app.add_handler(change_pass_conv)
+    
+    try:
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling() 
+        
+        while True:
+            await asyncio.sleep(1)
+
+    except asyncio.CancelledError: pass
+    except Exception as e: print(f"[FATAL] PTB run failed: {e}")
+    finally:
+        if app.running:
+            await app.updater.stop()
+            await app.stop()
+        await cleanup_clients()
+
+async def cleanup_clients():
+    """Safely disconnects all Telethon clients."""
+    all_clients = set(loaded_clients.values())
+    for chat_clients in clients.values():
+        all_clients.update(chat_clients.values())
+
+    disconnect_tasks = []
+    for client in all_clients:
+        if client and client.is_connected():
+            disconnect_tasks.append(client.disconnect())
+
+    if disconnect_tasks:
+        await asyncio.gather(*disconnect_tasks, return_exceptions=True)
+
+if __name__ == "__main__":
+    
+    if sys.platform == "win32":
+        try:
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        except AttributeError: pass
+            
+    try:
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(main())
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        print(f"[FATAL] An unexpected error occurred: {e}")
+    finally:
+        try:
+            pending = asyncio.all_tasks(loop)
+            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        except Exception: pass
+        finally:
+            if loop.is_running():
+                loop.stop()
+            if not loop.is_closed():
+                loop.close()
